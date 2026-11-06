@@ -1,0 +1,62 @@
+[project]
+name = "closebooks"
+version = "0.1.0"
+description = "AI finance team that closes the books: validation, fraud detection, reconciliation, audit trail"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic",
+    "pydantic>=2.8",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+    "typer>=0.12",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+    "duckdb>=1.1",
+    "jsonschema>=4.26.0",
+    "pypdf>=7.0.0",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+closebooks = "closebooks.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/closebooks"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["data", "out"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # allow Spanish accents/ñ in strings and comments
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "llm: tests that call the real Claude API (skipped unless RUN_LLM_TESTS=1)",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src"]
+pythonVersion = "3.12"

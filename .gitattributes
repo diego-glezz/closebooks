@@ -1,0 +1,5 @@
+# Official challenge data: store byte-for-byte (N43 is latin-1 + CRLF; CSVs/PDFs untouched)
+data/** -text
+*.gz binary
+*.pdf binary
+*.xlsx binary
