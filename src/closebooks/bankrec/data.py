@@ -226,6 +226,53 @@ def load_items(root: Path, phase: str) -> pd.DataFrame:
     return items
 
 
+# Detail files (batches, payment runs, advices) of the phases before the one we run: the bank
+# books a debit or credit days after its detail file is dated, so the first days of a phase cite
+# files that live in the previous phase's folder (evaluation windows already look back).
+PRIOR_PHASES = {"sample": ("train",), "live": ("train",), "final": ("train", "live")}
+LOOKBACK_DAYS = 120  # batches / payment runs (confirming debits come weeks later)
+ADVICE_LOOKBACK_DAYS = 20  # remittance advices (they arrive days after the cash)
+
+
+def _prior_rows(
+    root: Path, phase: str, sub: str, col: str, start: str, back: int, pattern: str = "*.csv"
+) -> pd.DataFrame:
+    """Rows of `sub/` of the earlier phases dated in [start - back, start) (never the phase itself)."""
+    lo = (pd.Timestamp(start) - pd.Timedelta(days=back)).strftime("%Y-%m-%d")
+    frames = []
+    for prior in PRIOR_PHASES.get(phase, ()):
+        df = _concat_dir(root / prior / sub, pattern)
+        if df.empty or col not in df:
+            continue
+        frames.append(df[(df[col] >= lo) & (df[col] < start)])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _with_prior(own: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFrame:
+    if prior.empty:
+        return own
+    if own.empty:
+        return prior.reset_index(drop=True)
+    both = pd.concat([own, prior], ignore_index=True)
+    return both.drop_duplicates(subset=[c for c in both.columns if c != "_file"]).reset_index(
+        drop=True
+    )
+
+
+def _prior_advice_index(root: Path, phase: str, start: str) -> pd.DataFrame:
+    lo = (pd.Timestamp(start) - pd.Timedelta(days=ADVICE_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    frames = []
+    for prior in PRIOR_PHASES.get(phase, ()):
+        d = root / prior / "remittance_advices"
+        if not (d / "index.csv").exists():
+            continue
+        df = _read_csv(d / "index.csv")
+        df = df[(df["received_date"] >= lo) & (df["received_date"] < start)].copy()
+        df["_dir"] = d.as_posix()  # the advice file is under its own phase's folder
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def load_phase(root: Path | str, phase: str) -> Phase:
     root = Path(root)
     if phase not in PHASES:
@@ -235,19 +282,38 @@ def load_phase(root: Path | str, phase: str) -> Phase:
     bank["amount_c"] = cents(bank["amount"])
     bank["orig_amount_c"] = cents(bank["orig_amount"])
     bank = bank.sort_values(["booking_date", "bank_txn_id"]).reset_index(drop=True)
+    start = str(bank["booking_date"].min())
+    remit = (
+        _read_csv(folder / "remittance_advices" / "index.csv")
+        if (folder / "remittance_advices" / "index.csv").exists()
+        else pd.DataFrame()
+    )
+    prior_remit = _prior_advice_index(root, phase, start)
+    if not prior_remit.empty:
+        remit = pd.concat([remit, prior_remit], ignore_index=True).fillna("")
     ph = Phase(
         name=phase,
         root=root,
         masters=load_masters(root, phase),
         bank=bank,
         items=load_items(root, phase),
-        dd=_concat_dir(folder / "direct_debit_batches"),
-        cards=_concat_dir(folder / "card_settlements"),
-        cheques=_concat_dir(folder / "cheque_deposits"),
-        runs=_concat_dir(folder / "payment_runs"),
-        remit_index=_read_csv(folder / "remittance_advices" / "index.csv")
-        if (folder / "remittance_advices" / "index.csv").exists()
-        else pd.DataFrame(),
+        dd=_with_prior(
+            _concat_dir(folder / "direct_debit_batches"),
+            _prior_rows(root, phase, "direct_debit_batches", "collection_date", start, LOOKBACK_DAYS),
+        ),
+        cards=_with_prior(
+            _concat_dir(folder / "card_settlements"),
+            _prior_rows(root, phase, "card_settlements", "settlement_date", start, LOOKBACK_DAYS),
+        ),
+        cheques=_with_prior(
+            _concat_dir(folder / "cheque_deposits"),
+            _prior_rows(root, phase, "cheque_deposits", "deposit_date", start, LOOKBACK_DAYS),
+        ),
+        runs=_with_prior(
+            _concat_dir(folder / "payment_runs"),
+            _prior_rows(root, phase, "payment_runs", "execution_date", start, LOOKBACK_DAYS),
+        ),
+        remit_index=remit,
         pdf_index=_read_csv(folder / "pdfs" / "index.csv")
         if (folder / "pdfs" / "index.csv").exists()
         else pd.DataFrame(),

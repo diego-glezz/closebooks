@@ -207,7 +207,7 @@ def load_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
 
     out: list[Advice] = []
     for r in index_rows:
-        path = folder / r["file"]
+        path = (Path(r["_dir"]) if r.get("_dir") else folder) / r["file"]
         if not path.exists():
             continue
         adv = Advice(
