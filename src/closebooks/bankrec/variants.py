@@ -1,7 +1,7 @@
 """Experiment switches for role B (references and third parties).
 
-Every field defaults to the behaviour of `main`, so an empty `CB_FLAGS` reproduces the baseline
-byte for byte. A candidate is described by a JSON object in the `CB_FLAGS` environment variable,
+Every field defaults to the behaviour of `main` except `two_pass_party`, which is on (measured
+gain on DEV). To reproduce the old baseline pass `two_pass_party=0`. A candidate is described by a JSON object in the `CB_FLAGS` environment variable,
 which lets a genetic search launch independent processes with different genomes.
 """
 
@@ -17,8 +17,15 @@ class Flags:
     # --- algorithms (booleans)
     iban_learn: bool = False  # learn payer IBANs from confidently matched receipts
     name_fuzzy: bool = False  # party by name: typos in the first word / words out of order
-    two_pass_party: bool = False  # exact/discount/plan across all payers before FIFO/subset
+    # exact/discount/plan across all payers before FIFO/subset. ON by default since 2026-11-07:
+    # DEV 2024-H2 85.99 -> 86.04 (party_subset precision 0.932 -> 0.944). HOLDOUT pending.
+    two_pass_party: bool = True
     ref_fuzzy: bool = False  # cited number with one wrong / transposed digit, same payer
+    # --- strategies from the TRAIN diagnosis (see scripts/analyze_b.py, diagnose_*.py)
+    fifo_subset: bool = False  # many-invoice payment: subset closest to FIFO order wins
+    fs_cap: int = 30  # oldest open items of the payer considered (2^15 sums per half)
+    fs_max_holes: int = 2  # unpaid older invoices tolerated inside the chosen subset
+    exact_recent_days: int = 0  # 0 = off; same-amount candidates: skip invoices older than this
     # --- numeric genes (default = value hard-coded in main)
     subset_recent_days: int = 240
     subset_cap: int = 22

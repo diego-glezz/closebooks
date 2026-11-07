@@ -36,7 +36,9 @@ from closebooks.bankrec.rules import (
     category_by_text,
     deduction_kind,
     discount_c,
+    fifo_pick,
     settle,
+    subset_solutions,
     unique_subset,
 )
 from closebooks.bankrec.text import alnum, fold, service_month, text_tokens
@@ -1035,6 +1037,11 @@ class Engine:
                 if (res := settle(self.book, [i], ctx, self.fx, self.terms, allow_partial=False))
                 and all(a.exception in ("", "FX_DIFFERENCE") for a in res)
             ]
+            if exact and FLAGS.exact_recent_days and len(exact) > 1:
+                # same amount, several open: invoices open for ages are dead, the payer
+                # settles a recent one (TRAIN: the golden one is never older than ~160 days)
+                lo = (_d(ctx.booking) - timedelta(days=FLAGS.exact_recent_days)).isoformat()
+                exact = [i for i in exact if self.book.items[i].issue >= lo] or exact
             if exact:
                 pick = exact[0]
                 if month and len(exact) > 1:
@@ -1085,6 +1092,10 @@ class Engine:
             res = self._unique_subset_alloc(open_ids, ctx)
             if res:
                 return Result(r["bank_txn_id"], res, rule="party_subset")
+            if FLAGS.fifo_subset:
+                res = self._fifo_subset_alloc(open_ids, ctx)
+                if res:
+                    return Result(r["bank_txn_id"], res, rule="party_fifo_subset")
             if rank > 0:
                 continue  # a short payment is only credible from the most likely payer
             # (e0) nothing open matches but we already collected/paid one of the party's documents
@@ -1166,6 +1177,42 @@ class Engine:
             if idx and 2 <= len(idx) <= (3 if has_cn else max_items):
                 res = settle(
                     self.book, [pool[k] for k in idx], ctx, self.fx, self.terms, allow_partial=False
+                )
+                if res:
+                    return res
+        return None
+
+    def _fifo_subset_alloc(self, open_ids: list[str], ctx: Ctx) -> list[Alloc] | None:
+        """A payment of many invoices without reference (POLICIES §5.6: customers pay the oldest
+        open invoices first). Pool = the payer's oldest open items; of all subsets adding up to
+        the cash, the one closest to a FIFO prefix wins if it is unique."""
+        pool = [i for i in open_ids if self.book.items[i].ccy == ctx.ccy]
+        if FLAGS.stale_days:
+            lo = (_d(ctx.booking) - timedelta(days=FLAGS.stale_days)).isoformat()
+            pool = [i for i in pool if self.book.items[i].issue >= lo]
+        pool = sorted(pool, key=lambda i: (self.book.items[i].issue, self.book.items[i].number, i))
+        pool = pool[: FLAGS.fs_cap]
+        if len(pool) < 2:
+            return None
+        values = [self._signed(i) for i in pool]
+        for target, tol in self._targets(ctx):
+            sols = subset_solutions(values, target, tol)
+            if not sols:
+                continue
+            sols = [
+                s
+                for s in sols
+                if len(s) >= 2 and any(not self.book.items[pool[k]].is_credit for k in s)
+            ]
+            pick = fifo_pick(sols, FLAGS.fs_max_holes) if sols else None
+            if pick:
+                res = settle(
+                    self.book,
+                    [pool[k] for k in pick],
+                    ctx,
+                    self.fx,
+                    self.terms,
+                    allow_partial=False,
                 )
                 if res:
                     return res

@@ -1,4 +1,4 @@
-"""Unit tests for text keys, advice parsing and the POLICIES exception rules (no data needed)."""
+﻿"""Unit tests for text keys, advice parsing and the POLICIES exception rules (no data needed)."""
 
 from __future__ import annotations
 
@@ -262,3 +262,35 @@ def test_name_matching_uses_same_normalization_on_both_sides():
     sup = pd.DataFrame(columns=["supplier_id", "entity", "name", "country", "iban"])
     p = Parties(cust, sup, {})
     assert p.by_name("ACH CREDIT POOL & SPA KING E HIJOS CCD", {"US01"})[0][0] == "C1"
+
+
+# ---------------------------------------------------------------- role B: FIFO subset
+
+
+def test_subset_solutions_finds_every_subset_within_tolerance():
+    from closebooks.bankrec.rules import subset_solutions
+
+    values = [100, 250, 300, 50, 400]
+    assert sorted(subset_solutions(values, 450, tol=0)) == [[0, 2, 3], [3, 4]]
+    assert subset_solutions(values, 10_000) == []
+    assert subset_solutions([1] * 14, 7, tol=0, limit=10) is None  # 3432 solutions: too generic
+
+
+def test_fifo_pick_prefers_the_prefix_and_abstains_on_ties():
+    from closebooks.bankrec.rules import fifo_pick
+
+    # items are in FIFO order: [0, 1, 2] is a prefix (0 holes), [0, 2, 4] leaves 2 older unpaid
+    assert fifo_pick([[0, 2, 4], [0, 1, 2]], max_holes=2) == [0, 1, 2]
+    assert fifo_pick([[0, 2, 3], [0, 1, 3]], max_holes=2) is None  # 1 hole each: tie, abstain
+    assert fifo_pick([[0, 2, 3], [0, 1, 4]], max_holes=2) == [0, 2, 3]  # 1 hole beats 2
+    assert fifo_pick([[2, 5]], max_holes=2) is None  # 4 holes: too far from FIFO
+
+
+def test_flags_defaults():
+    from closebooks.bankrec.variants import Flags
+
+    f = Flags()
+    assert f.two_pass_party  # the only switch on by default (DEV +0.05)
+    assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
+    assert (f.exact_recent_days, f.stale_days) == (0, 0)
+    assert (f.subset_recent_days, f.subset_cap, f.subset_max_items) == (240, 22, 5)

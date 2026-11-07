@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 
 BOOLS = ["iban_learn", "name_fuzzy", "two_pass_party", "ref_fuzzy"]
+# every genome passes ALL keys explicitly, so "baseline" below stays two_pass_party=0 even though
+# the engine default is now on
 CHOICES: dict[str, list[int]] = {
     "subset_recent_days": [120, 180, 240, 300, 365],
     "subset_cap": [18, 22, 26],
