@@ -137,6 +137,35 @@ def text_tokens(text: str | None) -> set[str]:
     return {k for k in out if len(k) >= 5}
 
 
+_PREFIXED = re.compile(r"^(.*?[A-Z].*?)(\d{4,})$")
+
+
+def expand_abbreviated(text: str | None, limit: int = 40) -> list[str]:
+    """Abbreviated sequences of document numbers (POLICIES §5.5: numbers without prefix, cut):
+    'FRAS FV23-03201 03266 03265' -> ['FV2303266', 'FV2303265'] (the prefix of the first number
+    is implicit); a shorter bare number replaces the END of the previous digit group
+    ('FV23-0103201 3266' -> 'FV230103266'). Returns alnum keys, in text order."""
+    if not text:
+        return []
+    out: list[str] = []
+    prefix = group = ""
+    for tok in _TOKEN.findall(_AMOUNT.sub(" ", fold(text))):
+        if tok.isdigit():
+            if prefix and 2 <= len(tok) <= len(group):
+                full = _NON_ALNUM.sub("", prefix + group[: len(group) - len(tok)] + tok)
+                if full not in out:
+                    out.append(full)
+                    if len(out) >= limit:
+                        break
+            continue
+        m = _PREFIXED.match(tok)
+        if m:
+            prefix, group = m.group(1), m.group(2)
+        else:
+            prefix = group = ""
+    return out
+
+
 MONTHS = {
     "ENE": 1,
     "ENERO": 1,

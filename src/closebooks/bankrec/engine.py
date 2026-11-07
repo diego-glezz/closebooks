@@ -44,7 +44,7 @@ from closebooks.bankrec.rules import (
     subset_solutions,
     unique_subset,
 )
-from closebooks.bankrec.text import alnum, fold, service_month, text_tokens
+from closebooks.bankrec.text import alnum, expand_abbreviated, fold, service_month, text_tokens
 from closebooks.bankrec.variants import FLAGS
 
 AP_FACTORY = {"ES00": {"ES00", "ES01", "ES02", "PT01"}}
@@ -617,6 +617,8 @@ class Engine:
         res = self._by_reference(r, ctx, text, parties, scope, receipt)
         if res and getattr(self, "_ref_other", False):
             res.rule += "_other"  # own rule tag: precision measurable in explain.csv.gz
+        if res and getattr(self, "_ref_expanded", False):
+            res.rule += "_exp"  # a document found only through an expanded abbreviation
         if not res and FLAGS.ref_fuzzy and parties:
             res = self._by_fuzzy_reference(r, ctx, text, parties, scope, receipt)
         if res:
@@ -639,7 +641,11 @@ class Engine:
         )
         if known and FLAGS.unid_selective:
             # cash-like receipts (small or round) stay UNIDENTIFIED even with a known payer
-            known = not (ctx.cash_c < FLAGS.unid_small * 100 or ctx.cash_c % 100 == 0)
+            size = ctx.cash_c
+            if FLAGS.unid_small_eur and ctx.ccy != "EUR":
+                # 1,000 MXN is ~50 EUR: compare cash-like size in one currency
+                size = self.fx.convert(ctx.cash_c, ctx.ccy, "EUR", ctx.booking) or ctx.cash_c
+            known = not (size < FLAGS.unid_small * 100 or ctx.cash_c % 100 == 0)
         guess = self.cats.fallback(r)
         if guess:
             exc = "UNIDENTIFIED" if guess == "UNIDENTIFIED" else ""
@@ -981,9 +987,16 @@ class Engine:
             fam |= self.parties.family(p)
         txn = r["bank_txn_id"]
         self._ref_other = False  # reset per line: set only when ref_trust_other decides
+        self._ref_expanded = False
         cands: dict[str, None] = {}
         strong: set[str] = set()
-        for tok in sorted(text_tokens(text)):
+        toks = sorted(text_tokens(text))
+        expanded: set[str] = set()
+        if FLAGS.ref_expand:
+            expanded = {t for t in expand_abbreviated(text) if t not in toks}
+            toks += sorted(expanded)
+        from_expansion: set[str] = set()
+        for tok in toks:
             hits = [(iid, False) for iid in self.book.lookup(tok)]
             if FLAGS.ref_po:  # the customer's own order number (indexed as "PO:<key>")
                 hits += [(iid, True) for iid in self.book.lookup("PO:" + tok)]
@@ -991,6 +1004,11 @@ class Engine:
                 it = self.book.items[iid]
                 if it.kind in kinds and it.entity in scope and it.issue <= ctx.booking:
                     key = self.book.replaced_by.get(iid, iid)
+                    if tok in expanded:
+                        if key not in cands:
+                            from_expansion.add(key)
+                        continue  # decided below, against the anchor's party
+                    from_expansion.discard(key)
                     cands[key] = None
                     # full printed number (or 8+ digits of it) vs a short suffix like '415289';
                     # a PO is only strong when the whole PO is cited
@@ -1000,6 +1018,16 @@ class Engine:
                         else (len(tok) >= 8 or tok == alnum(it.number))
                     ):
                         strong.add(key)
+        if from_expansion:
+            # an expanded abbreviation only counts for the customer of the documents cited in
+            # full (the anchor) or of the identified payer: a bare '2024' after 'FV23-03201'
+            # must not become someone else's FV23-02024
+            anchor = {self.book.items[i].party for i in cands} | fam
+            for key in sorted(from_expansion):
+                if key not in cands and self.book.items[key].party in anchor:
+                    cands[key] = None
+                    strong.add(key)
+                    self._ref_expanded = True
         if not cands:
             return self._why(txn, "no_candidates")
         ids = [i for i in cands if i not in self.book.cancelled]
@@ -1093,7 +1121,8 @@ class Engine:
             if res:
                 return Result(r["bank_txn_id"], res, rule="ref_set")
         strict = self._ref_other and FLAGS.trust_no_partial  # measured: _other partials ~0.5
-        if FLAGS.ref_cn_subset and not strict:
+        guarded = FLAGS.cn_guard and any(self.book.paid.get(i) or i in self.plan for i in open_inv)
+        if FLAGS.ref_cn_subset and not strict and not guarded:
             # cited invoices paid net of SOME of the party's open credit notes (POLICIES: credit
             # notes are netted): the shortfall must be the unique subset of those credit notes
             res = self._net_of_credits(open_inv + credits, party_credits, ctx)

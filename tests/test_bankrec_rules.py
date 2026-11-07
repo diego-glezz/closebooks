@@ -433,7 +433,8 @@ def test_flags_defaults():
 
     f = Flags()
     assert f.two_pass_party and f.ref_cn_subset and f.ref_po and f.complete_near  # measured ON
-    assert f.unid_selective and f.unid_small == 1000
+    assert f.unid_selective and f.unid_small == 1000 and f.unid_small_eur and f.ref_expand
+    assert not (f.cn_guard or f.subset_max_items != 5)  # measured: no gain / worse
     assert not any((f.ref_corroborate, f.ref_trust_other, f.trace_ref, f.unid_known_payer))
     assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
     assert (f.exact_recent_days, f.stale_days) == (0, 0)
@@ -514,3 +515,14 @@ def test_weak_citations_are_accepted_only_when_they_agree_on_one_party():
     assert engine._corroborated(fake, [one, other], set(), ctx(31000)) == [other]
     # strong citations are not part of the vote
     assert engine._corroborated(fake, [one, two], {one, two}, ctx(65000)) == []
+
+
+def test_expand_abbreviated_sequences_reuse_the_prefix_of_the_first_number():
+    from closebooks.bankrec.text import expand_abbreviated
+
+    assert expand_abbreviated("FRAS FV23-03201 03266 03265") == ["FV2303266", "FV2303265"]
+    # a shorter bare number replaces the end of the previous digit group
+    assert expand_abbreviated("PAGO FV23-0103201 3266") == ["FV230103266"]
+    # amounts are not numbers to expand; a new prefixed number resets the anchor
+    assert expand_abbreviated("FV23-03201 1.210,00 RE24-55555 66666") == ["RE2466666"]
+    assert expand_abbreviated("TRANSFERENCIA 2024 03266") == []  # no prefixed anchor

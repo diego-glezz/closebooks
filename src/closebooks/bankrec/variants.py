@@ -47,6 +47,15 @@ class Flags:
     # ON since 2026-11-07 (merged A+B+C+D code): DEV 88.69 -> 89.22, HOLDOUT 88.56 -> 89.07
     unid_selective: bool = True
     unid_small: int = 1000  # account-currency units under which a receipt is "cash-like"
+    # 14-upgrade: the "small" threshold in EUR equivalent (ECB rate). ON: DEV 89.22 -> 89.23,
+    # HOLDOUT 89.07 -> 89.08; also keeps the rule sane for the new ZAR subsidiary in FINAL
+    unid_small_eur: bool = True
+    # 'FV23-03201 03266' -> FV23-03266 (implicit prefix), POLICIES §5.5. ON: DEV +0.01,
+    # HOLDOUT +0.01; its pairs have precision 0.996-1.000
+    ref_expand: bool = True
+    # ref_set_cn never on invoices already partly paid or with a PDF instalment plan: their
+    # shortfall is a remainder / instalment / dispute (POLICIES §3), not credit notes
+    cn_guard: bool = False
     # --- numeric genes (default = value hard-coded in main)
     subset_recent_days: int = 240
     subset_cap: int = 22
