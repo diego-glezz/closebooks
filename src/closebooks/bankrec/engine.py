@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -80,9 +81,16 @@ def _overpay_pattern(excess: int, total: int) -> bool:
 
 class Engine:
     def __init__(
-        self, ph: Phase, cache_dir: Path | None = None, category_model: Path | None = None
+        self,
+        ph: Phase,
+        cache_dir: Path | None = None,
+        category_model: Path | None = None,
+        on_step: Callable[[str], None] | None = None,
     ):
+        """`on_step(msg)` is called when each slow setup step starts (progress display only)."""
+        step = on_step or (lambda _msg: None)
         self.ph = ph
+        step("libro de partidas y terceros")
         m = ph.masters
         self.book = Book(ph.items)
         self.parties = Parties(m.customers, m.suppliers, self.book.items)
@@ -101,7 +109,9 @@ class Engine:
         self.linked: dict[str, tuple[str, object]] = {}
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
+        step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
+        step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
         self._link_details()
 
     # ================================================================ setup
@@ -122,12 +132,28 @@ class Engine:
             if dtype not in ("invoice", "supplier_invoice", "credit_note", "supplier_credit_note"):
                 continue
             side = "AR" if dtype in ("invoice", "credit_note") else "AP"
-            ids = self.book.find_number(r["document_number"], side=side, entities={r["entity"]})
+            ents = {r["entity"]}
+            # A PDF of an earlier phase (LIVE/FINAL context) only describes items carried over
+            # from that phase: exact number, issued no later than the PDF itself. The noisy-key
+            # fallback of find_number would otherwise attach its clauses to look-alike numbers of
+            # THIS phase (measured on LIVE: 1,849 items wrongly cancelled as "replaced").
+            prior = bool(r.get("_src"))
+            doc_date = str(r.get("document_date", ""))[:10]
+            ids = (
+                self._carried(r["document_number"], side, ents, doc_date)
+                if prior
+                else self.book.find_number(r["document_number"], side=side, entities=ents)
+            )
             if not ids:
                 continue
             new = ids[0]
             if c.replaces:
-                for old in self.book.find_number(c.replaces, side=side, entities={r["entity"]}):
+                olds = (
+                    self._carried(c.replaces, side, ents, doc_date)
+                    if prior
+                    else self.book.find_number(c.replaces, side=side, entities=ents)
+                )
+                for old in olds:
                     if old != new:
                         self.book.cancelled.add(old)
                         self.book.replaced_by[old] = new
@@ -143,6 +169,16 @@ class Engine:
                 for old in self.book.find_number(it.related, side=it.side, entities={it.entity}):
                     if old in self.book.cancelled:
                         self.book.cancelled.add(iid)
+
+    def _carried(self, number: str, side: str, entities: set[str], before: str) -> list[str]:
+        """Items with exactly this printed number (no noisy keys), issued on or before `before`."""
+        return [
+            i
+            for i in self.book.by_number.get(alnum(number), [])
+            if self.book.items[i].side == side
+            and self.book.items[i].entity in entities
+            and (not before or self.book.items[i].issue <= before)
+        ]
 
     def _bank_indexes(self) -> None:
         b = self.ph.bank
@@ -1131,9 +1167,16 @@ class Engine:
 
     # ================================================================ run
 
-    def run(self) -> list[Result]:
+    def run(
+        self, progress: Callable[[int, int], None] | None = None, every: int = 1000
+    ) -> list[Result]:
+        """Process every bank line in booking order. `progress(done, total)` is called every
+        `every` lines and at the end (display only: it does not change any result)."""
         out = []
-        for r in self.rows:
+        total = len(self.rows)
+        for n, r in enumerate(self.rows, start=1):
+            if progress and n % every == 0:
+                progress(n, total)
             try:
                 out.append(self.process(r))
             except Exception as exc:  # never lose a line: fall back to a safe row
@@ -1146,4 +1189,6 @@ class Engine:
                         rule=f"error:{type(exc).__name__}",
                     )
                 )
+        if progress:
+            progress(total, total)
         return out
