@@ -44,6 +44,13 @@ class Flags:
     # (marginal precision already 0.82 from k=4 to k=5)
     complete_k: int = 5
     complete_pool: int = 25  # open items (closest in issue date) the completion searches
+    # completion subsets of this size or more must be the ONLY one adding up to the cents
+    # (like unique_subset); 99 = off (first match wins, behaviour of main)
+    unique_from_k: int = 99
+    # re-try unresolved receipts of a known payer at the END of the pass, against the items
+    # still open then; accept only a UNIQUE exact subset (POLICIES §1: each item settled once)
+    second_pass: bool = False
+    second_pass_max: int = 30  # payer pool size limit (2^15 sums per half)
     trust_no_partial: bool = False  # ref_trust_other only for exact / completed sets (no PARTIAL)
     unid_known_payer: bool = False  # payer known with open invoices: no UNIDENTIFIED exception
     # "UNIDENTIFIED selectivo": like unid_known_payer, but cash-like receipts (small or round

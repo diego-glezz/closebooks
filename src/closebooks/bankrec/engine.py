@@ -1607,9 +1607,16 @@ class Engine:
                     key=lambda i: (abs((_d(self.book.items[i].issue) - anchor).days), i),
                 )[: FLAGS.complete_pool]
             for k in range(1, FLAGS.complete_k + 1):
+                found: list[str] | None = None
                 for sub in itertools.combinations(small, k):
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:
-                        return list(sub)
+                        if k < FLAGS.unique_from_k:
+                            return list(sub)
+                        if found is not None:
+                            return None  # several k-subsets fit the cents: ambiguous, abstain
+                        found = list(sub)
+                if found is not None:
+                    return found
         return None
 
     # ================================================================ run
@@ -1636,6 +1643,56 @@ class Engine:
                         rule=f"error:{type(exc).__name__}",
                     )
                 )
+        if FLAGS.second_pass:
+            self._second_pass(out)
         if progress:
             progress(total, total)
         return out
+
+    _UNRESOLVED = (
+        "unidentified",
+        "unidentified_known",
+        "category_learned_fallback",
+        "category_learned_fallback_known",
+    )
+
+    def _second_pass(self, out: list[Result]) -> None:
+        """Receipts left without items although the payer is known, re-tried at the END of the
+        chronological pass. Every item is settled once (POLICIES §1): what later referenced
+        payments cleared is gone, so the payer's pool is much smaller than it was on the day and
+        the subset of open items that adds up to the cash, if UNIQUE, is strong evidence."""
+        for k, r in enumerate(self.rows):
+            res = out[k]
+            if res.rule not in self._UNRESOLVED or int(r["amount_c"]) <= 0:
+                continue
+            try:
+                ctx = self._ctx(r)
+                parties = self._parties_of(r, self._scope(r, True))
+                if not parties:
+                    continue
+                ctx.payer_country = self.parties.country.get(parties[0], "")
+                pool = sorted(
+                    {
+                        i
+                        for q in sorted(self.parties.family(parties[0]))
+                        for i in self.book.open_items(q, ctx.booking, "AR")
+                        if self.book.items[i].ccy == ctx.ccy
+                    }
+                )
+                if not pool or len(pool) > FLAGS.second_pass_max:
+                    continue
+                values = [self._signed(i) for i in pool]
+                pick = None
+                for target, tol in self._targets(ctx):
+                    sols = subset_solutions(values, target, tol, limit=1)
+                    if sols and len(sols) == 1:
+                        pick = [pool[j] for j in sols[0]]
+                        break
+                if not pick or all(self.book.items[i].is_credit for i in pick):
+                    continue
+                allocs = settle(self.book, pick, ctx, self.fx, self.terms, allow_partial=False)
+                if not allocs:
+                    continue
+                out[k] = self._finish(Result(res.txn, allocs, rule="second_pass"))
+            except Exception:  # noqa: BLE001 - a failed retry keeps the first-pass answer
+                continue
