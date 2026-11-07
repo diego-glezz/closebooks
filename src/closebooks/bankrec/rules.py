@@ -324,6 +324,23 @@ def deduction_kind(reason: str) -> str:
     return "dispute"
 
 
+def deduction_kind_by_amount(
+    it: Item, deduction_c: int, terms: dict[str, tuple[float, int]], payer_country: str
+) -> str:
+    """Classify a deduction that states no reason (the 2025-09 advice layout), by its amount:
+    the early-payment discount of the invoice terms, a tax withheld at source (POLICIES §3), or
+    else a dispute. The discount may be taken late: it is still a discount (-> PARTIAL)."""
+    ded = abs(deduction_c)
+    pct, _days_ = terms.get(it.terms, (0.0, 0))
+    if pct and not it.is_credit and abs(ded - round(it.total * pct / 100)) <= 1:
+        return "discount"
+    if payer_country in WITHHOLDING_COUNTRIES and any(
+        abs(ded - round(it.total * rate / 100)) <= 1 for rate in WITHHOLDING_RATES
+    ):
+        return "withholding"
+    return "dispute"
+
+
 def unique_subset(
     values: list[int], target: int, tol: int = 1, max_solutions: int = 2
 ) -> list[int] | None:

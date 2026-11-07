@@ -35,6 +35,7 @@ from closebooks.bankrec.rules import (
     Ctx,
     category_by_text,
     deduction_kind,
+    deduction_kind_by_amount,
     discount_c,
     settle,
     unique_subset,
@@ -642,6 +643,7 @@ class Engine:
         fam: set[str] = set()
         for p, _ in ps[:2]:
             fam |= self.parties.family(p)
+        payer_country = self.parties.country.get(ps[0][0], "") if ps else ""
         allocs: list[Alloc] = []
         for ln in adv.lines:
             ids = [
@@ -667,7 +669,13 @@ class Engine:
             it = self.book.items[iid]
             paid = abs(ln.paid)
             open_c = self.book.open[iid] or it.total
-            kind = deduction_kind(ln.reason) if ln.deduction_c else ""
+            kind = ""
+            if ln.deduction_c:
+                kind = (
+                    deduction_kind(ln.reason)
+                    if ln.reason.strip()
+                    else deduction_kind_by_amount(it, ln.deduction_c, self.terms, payer_country)
+                )
             if it.is_credit:
                 allocs.append(Alloc(iid, open_c, ""))
             elif kind == "discount":

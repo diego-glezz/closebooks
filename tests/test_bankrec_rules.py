@@ -220,6 +220,57 @@ def test_deduction_kind():
     assert deduction_kind("PENAL. RETRASO") == "dispute"
 
 
+def test_parse_xlsx_advice_layout_of_2025_09():
+    """Voucher | Invoice | PO | Inv. date | Amount | Deduction | Net paid (no reason column)."""
+    adv = Advice(file="x.xlsx", entity="AU01", payer="P", received="")
+    _parse_csv_rows(
+        [
+            ["Pool & Spa Sol Pty Ltd", "", "", "", "", "", ""],
+            ["Payment advice", "2057001209", "2025-09-01", "", "", "", ""],
+            ["Voucher", "Invoice", "PO", "Inv. date", "Amount", "Deduction", "Net paid"],
+            ["VCHR65740934", "320871", "4517600404", "2024-09-13", "1044.09", "0", "1044.09"],
+            ["VCHR04037863", "306817", "4554233277", "2025-03-10", "4943.81", "-98.88", "4844.93"],
+        ],
+        adv,
+    )
+    assert adv.ref == "2057001209" and adv.pay_date == "2025-09-01"
+    assert [ln.number for ln in adv.lines] == ["320871", "306817"]  # the invoice, not the voucher
+    assert adv.lines[0].gross_c == 104409 and adv.lines[0].paid == 104409
+    assert adv.lines[1].deduction_c == -9888 and adv.lines[1].paid == 484493
+    assert adv.lines[1].reason == ""
+
+
+def test_parse_pdf_advice_deduction_and_reason_on_one_line():
+    from closebooks.bankrec.docs import _parse_pdf_text
+
+    adv = Advice(file="x.pdf", entity="DE01", payer="P", received="")
+    _parse_pdf_text(
+        "REMITTANCE ADVICE\nDocument\nDate\nGross\nDeduction\nPaid\n"
+        "RE250106321\n04/04/2025\n4,371.12\n4,371.12\n"
+        "RE250106102\n02/04/2025\n2,422.74\n-121.13 PENAL. RETRASO\n2,301.61\n"
+        "RE250106165\n03/04/2025\n2,708.15\n2,708.15\n",
+        adv,
+    )
+    assert [ln.number for ln in adv.lines] == ["RE250106321", "RE250106102", "RE250106165"]
+    ln = adv.lines[1]
+    assert (ln.gross_c, ln.deduction_c, ln.paid_c) == (242274, -12113, 230161)
+    assert ln.reason == "PENAL. RETRASO"
+    assert adv.lines[2].paid == 270815  # the table keeps being read after the deduction
+
+
+def test_deduction_without_reason_is_classified_by_amount():
+    from closebooks.bankrec.rules import deduction_kind_by_amount
+
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20", "D2N30"))
+    it = book.items["ARI-2025-0000001"]
+    assert deduction_kind_by_amount(it, -2000, TERMS, "ES") == "discount"  # 2 % of the total
+    assert deduction_kind_by_amount(it, -1500, TERMS, "ES") == "dispute"
+    assert deduction_kind_by_amount(it, -1500, TERMS, "MX") == "withholding"  # 1.5 %
+    assert deduction_kind_by_amount(it, -1500, TERMS, "BR") == "withholding"
+    plain = make_book(("ARI-2025-0000002", "FV25-2", 100000, "2025-05-20", "T30"))
+    assert deduction_kind_by_amount(plain.items["ARI-2025-0000002"], -2000, TERMS, "ES") == "dispute"
+
+
 def test_pdf_payment_plans():
     c = parse_clauses(
         "Forma de pago: 3 vencimientos a 60/90/120 dias (642,98 / 642,98 / 642,99 EUR)."
