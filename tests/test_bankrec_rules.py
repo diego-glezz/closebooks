@@ -436,6 +436,7 @@ def test_flags_defaults():
     assert f.unid_selective and f.unid_small == 1000 and f.unid_small_eur and f.ref_expand
     assert not (f.cn_guard or f.subset_max_items != 5)  # measured: no gain / worse
     assert f.complete_k == 5 and f.complete_pool == 25 and not f.unid_cap  # round 7-8
+    assert f.second_pass and f.second_pass_age == 365 and f.second_pass_max == 30  # round 11
     assert not any((f.ref_corroborate, f.ref_trust_other, f.trace_ref, f.unid_known_payer))
     assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
     assert (f.exact_recent_days, f.stale_days) == (0, 0)

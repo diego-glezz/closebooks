@@ -49,8 +49,14 @@ class Flags:
     unique_from_k: int = 99
     # re-try unresolved receipts of a known payer at the END of the pass, against the items
     # still open then; accept only a UNIQUE exact subset (POLICIES §1: each item settled once)
-    second_pass: bool = False
+    # ON since 2026-11-07 with second_pass_age=365: DEV 89.42 -> 89.81, HOLDOUT 89.27 -> 89.66,
+    # second_pass pair precision 0.929 / 0.925 (without the age filter: 0.81 / 0.76)
+    second_pass: bool = True
     second_pass_max: int = 30  # payer pool size limit (2^15 sums per half)
+    # measured on DEV: subsets with an invoice open > 365 days are right 34 % of the time
+    # (<= 180 days: 94-97 %); dead invoices are left out of the second-pass pool
+    second_pass_age: int = 365  # 0 = off; max days between invoice issue and the receipt
+    second_pass_kmax: int = 99  # max invoices in the accepted subset
     trust_no_partial: bool = False  # ref_trust_other only for exact / completed sets (no PARTIAL)
     unid_known_payer: bool = False  # payer known with open invoices: no UNIDENTIFIED exception
     # "UNIDENTIFIED selectivo": like unid_known_payer, but cash-like receipts (small or round

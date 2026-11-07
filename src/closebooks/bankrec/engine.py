@@ -1679,13 +1679,16 @@ class Engine:
                         if self.book.items[i].ccy == ctx.ccy
                     }
                 )
+                if FLAGS.second_pass_age:
+                    lo = (_d(ctx.booking) - timedelta(days=FLAGS.second_pass_age)).isoformat()
+                    pool = [i for i in pool if self.book.items[i].issue >= lo]
                 if not pool or len(pool) > FLAGS.second_pass_max:
                     continue
                 values = [self._signed(i) for i in pool]
                 pick = None
                 for target, tol in self._targets(ctx):
                     sols = subset_solutions(values, target, tol, limit=1)
-                    if sols and len(sols) == 1:
+                    if sols and len(sols) == 1 and len(sols[0]) <= FLAGS.second_pass_kmax:
                         pick = [pool[j] for j in sols[0]]
                         break
                 if not pick or all(self.book.items[i].is_credit for i in pick):
