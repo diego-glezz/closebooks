@@ -378,7 +378,7 @@ _PLAN = re.compile(
 )
 _PAYABLE = re.compile(
     r"(?:Importe (?:neto )?a pagar(?: al vencimiento)?|Amount payable at due date|"
-    r"Net amount payable|Montant (?:net )?[àa] payer|Zahlbetrag|Zu zahlen)"
+    r"Net amount payable|Net amount due|Montant (?:net )?[àa] payer|Zahlbetrag|Zu zahlen)"
     r"\s*:?\s*(-?\d[\d .,]*\d)",
     re.I,
 )

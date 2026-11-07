@@ -291,7 +291,10 @@ def _with_prior_context(ph: Phase, root: Path, phase: str) -> Phase:
         for p in prior:
             df = _index(root / p, sub)
             if not df.empty and col in df:
-                df = df[(df[col] >= since(back)) & (df[col] < cut)].copy()
+                keep = df[col] >= since(back)
+                if "document_type" in df:  # bank-details notices never expire (POLICIES §5.11)
+                    keep |= df["document_type"] == "bank_account_notice"
+                df = df[keep & (df[col] < cut)].copy()
                 df["_folder"] = str(root / p / sub)
                 df["_src"] = p
                 extra.append(df)
@@ -397,8 +400,10 @@ def load_window(root: Path | str, start: str, end: str, name: str | None = None)
     pdf_index = _read_csv(pdfs) if pdfs.exists() else pd.DataFrame()
     if not pdf_index.empty:  # documents of items we can still see (open or in the window)
         lo = (pd.Timestamp(start) - pd.Timedelta(days=550)).strftime("%Y-%m-%d")
+        # a new-bank-details notice stays valid however old it is (POLICIES §5.11)
+        notice = pdf_index["document_type"] == "bank_account_notice"
         pdf_index = pdf_index[
-            (pdf_index["document_date"] >= lo) & (pdf_index["document_date"] <= end)
+            ((pdf_index["document_date"] >= lo) | notice) & (pdf_index["document_date"] <= end)
         ].reset_index(drop=True)
     return Phase(
         name=name,
