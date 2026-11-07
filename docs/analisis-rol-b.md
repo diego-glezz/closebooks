@@ -141,6 +141,8 @@ añadidas / parejas añadidas.
 | `pdf_exact` | 85,96 | 85,66 | ver §1 | no en todas las filas; sí en las de fases anteriores |
 | `pdf_dated` (claves difusas sí, pero nunca hacia partidas emitidas después de la fecha del PDF) | 85,98 | 85,67 | DEV/HOLDOUT casi neutro (−0,01). En LIVE con el código de b71f626 quita **3.548 de las 4.346** anulaciones de PDFs de TRAIN (quedan 798, cerca de los 754 "anula y sustituye" de A) y recupera las 4 partidas de ejemplo de §1. Test: `test_pdf_clauses_never_touch_invoices_issued_after_the_pdf` | arreglo candidato para b71f626; el juez es un envío LIVE (DEV no tiene la colisión entre fases) |
 
+**Envío LIVE de `ref_cn_subset`** (`s_d3818e3904faf7891a83`, código 4b57e65, sobre el motor base sin contexto previo): **82,23 → 82,28**. F1 0,8449 → 0,8453, txn 0,9043 → 0,9051, P igual (0,9926); ar_1toN_credit_note 0,481 → 0,532 (+168 líneas), ar_ref_noise +42, ar_instalment −19. Es independiente del envío de A 916a357 (82,60, contexto previo con número exacto): juntos deberían rondar 82,65.
+
 **Algoritmo genético:** no lo he lanzado. `ga_b.py --workers 8 --generations 3 --pop 16` son 48 evaluaciones de
 13-19 min cada una (con 5-6 procesos a la vez; cada uno ocupa 3-4 GB y la máquina tiene 32 GB): **≈ 2 h solo DEV**,
 más HOLDOUT. Con los flags midiendo ±0,05, no compensa.
