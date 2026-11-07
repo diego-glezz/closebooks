@@ -305,9 +305,19 @@ def _parse_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
 # ---------------------------------------------------------------- document PDFs
 
 
-def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, str]:
+PARALLEL_MIN = 300  # PDFs to extract before it pays to start worker processes
+
+
+def _extract_pdf(path: str) -> str:
     import pypdf
 
+    try:
+        return "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(path).pages)
+    except Exception:
+        return ""
+
+
+def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, str]:
     texts: dict[str, str] = {}
     if cache.exists():
         texts = json.loads(cache.read_text(encoding="utf-8"))
@@ -323,15 +333,26 @@ def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, st
             for f in sorted(want & seen.keys()):
                 texts[f] = seen[f]
             want -= seen.keys()
+    todo: dict[str, str] = {}
     for r in missing:
         f = r["file"]
-        if f in texts:
-            continue
-        base = Path(r["_folder"]) if r.get("_folder") else folder
-        try:
-            texts[f] = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(base / f).pages)
-        except Exception:
-            texts[f] = ""
+        if f not in texts and f not in todo:
+            todo[f] = str((Path(r["_folder"]) if r.get("_folder") else folder) / f)
+    if len(todo) >= PARALLEL_MIN:
+        # a cold FINAL has ~17,000 PDFs of its own (~20 ms each): extract them on every core.
+        # Each file is independent and lands under its own key -> same result as the serial loop.
+        from concurrent.futures import ProcessPoolExecutor
+
+        names = sorted(todo)
+        workers = max(1, min(16, (os.cpu_count() or 2) - 1))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for f, t in zip(
+                names, ex.map(_extract_pdf, [todo[n] for n in names], chunksize=64), strict=True
+            ):
+                texts[f] = t
+    else:
+        for f, path in todo.items():
+            texts[f] = _extract_pdf(path)
     if missing:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
