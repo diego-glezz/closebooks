@@ -101,6 +101,7 @@ class Engine:
         self.cache_dir = cache_dir or Path("out/cache")
         self.cats = CategoryModel(category_model)
         self.linked: dict[str, tuple[str, object]] = {}
+        self.ref_why: dict[str, str] = {}  # trace_ref: txn -> why _by_reference gave up
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
         self._load_pdf_clauses()
@@ -523,6 +524,8 @@ class Engine:
             if res:
                 return self._finish(res)
         res = self._by_reference(r, ctx, text, parties, scope, receipt)
+        if res and getattr(self, "_ref_other", False):
+            res.rule += "_other"  # own rule tag: precision measurable in explain.csv.gz
         if not res and FLAGS.ref_fuzzy and parties:
             res = self._by_fuzzy_reference(r, ctx, text, parties, scope, receipt)
         if res:
@@ -853,29 +856,52 @@ class Engine:
         fam: set[str] = set()
         for p in parties[: FLAGS.fam_parties]:
             fam |= self.parties.family(p)
+        txn = r["bank_txn_id"]
+        self._ref_other = False  # reset per line: set only when ref_trust_other decides
         cands: dict[str, None] = {}
         strong: set[str] = set()
         for tok in sorted(text_tokens(text)):
-            for iid in self.book.lookup(tok):
+            hits = [(iid, False) for iid in self.book.lookup(tok)]
+            if FLAGS.ref_po:  # the customer's own order number (indexed as "PO:<key>")
+                hits += [(iid, True) for iid in self.book.lookup("PO:" + tok)]
+            for iid, by_po in hits:
                 it = self.book.items[iid]
                 if it.kind in kinds and it.entity in scope and it.issue <= ctx.booking:
                     key = self.book.replaced_by.get(iid, iid)
                     cands[key] = None
-                    # full printed number (or 8+ digits of it) vs a short suffix like '415289'
-                    if len(tok) >= 8 or tok == alnum(it.number):
+                    # full printed number (or 8+ digits of it) vs a short suffix like '415289';
+                    # a PO is only strong when the whole PO is cited
+                    if (tok == alnum(it.po)) if by_po else (len(tok) >= 8 or tok == alnum(it.number)):
                         strong.add(key)
         if not cands:
-            return None
+            return self._why(txn, "no_candidates")
         ids = [i for i in cands if i not in self.book.cancelled]
+        agreed = self._corroborated(ids, strong, ctx) if FLAGS.ref_corroborate else []
         if not fam:  # unknown payer: a short suffix alone is too weak unless the amount matches
-            ids = [i for i in ids if i in strong or abs(self.book.open[i] - ctx.cash_c) <= 1]
+            ids = [
+                i
+                for i in ids
+                if i in strong or i in agreed or abs(self.book.open[i] - ctx.cash_c) <= 1
+            ]
+            if not ids:
+                return self._why(txn, "weak_refs_unknown_payer")
         if fam:
             own = [i for i in ids if self.book.items[i].party in fam]
             # payer known but the reference points to someone else: only trust it when the
-            # amount matches exactly (agencies / confirming banks quote the debtor's invoice)
-            ids = own or [i for i in ids if abs(self.book.open[i] - ctx.cash_c) <= 1]
+            # amount matches exactly (agencies / confirming banks quote the debtor's invoice),
+            # or (ref_corroborate) when several cited documents agree on that other party
+            pre = ids
+            ids = own or [i for i in ids if abs(self.book.open[i] - ctx.cash_c) <= 1] or agreed
+            if not ids and FLAGS.ref_trust_other:
+                # POLICIES §5.1: who pays is not always the customer (parent, agency, confirming,
+                # renamed customer). Full printed numbers that all belong to ONE other party are
+                # stronger evidence than a name match.
+                full = [i for i in pre if i in strong]
+                if full and len({self.book.items[i].party for i in full}) == 1:
+                    ids = full
+                    self._ref_other = True
             if not ids:
-                return None
+                return self._why(txn, "refs_of_another_party")
         # main side first: receipts settle ARI, payments API
         main = "ARI" if receipt else "API"
         inv = [i for i in ids if self.book.items[i].kind == main]
@@ -891,7 +917,7 @@ class Engine:
             if cn:
                 amt = self.book.open[cn[0]] or self.book.items[cn[0]].total
                 return Result(r["bank_txn_id"], [Alloc(cn[0], amt, "")], rule="ref_refund")
-            return None
+            return self._why(txn, "no_invoice_on_main_side")
         if len({self.book.items[i].party for i in inv}) > 1 and not fam:
             # ambiguous party: keep the ones whose amounts can explain the cash
             exact = [i for i in inv if abs(self.book.open[i] - ctx.cash_c) <= 1]
@@ -913,7 +939,7 @@ class Engine:
                     [Alloc(closed[0], ctx.cash_c, "DUPLICATE_PAYMENT")],
                     rule="ref_duplicate",
                 )
-            return None
+            return self._why(txn, "cited_already_closed")
         # try: cited invoices; cited + party credit notes; subsets of cited invoices
         party = self.book.items[open_inv[0]].party
         credits = [i for i in ids if self.book.items[i].is_credit and self.book.open[i] > 0]
@@ -966,7 +992,32 @@ class Engine:
                     if res:
                         return Result(r["bank_txn_id"], res, rule="ref_subset")
         res = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
-        return Result(r["bank_txn_id"], res, rule="ref_partial") if res else None
+        if res:
+            return Result(r["bank_txn_id"], res, rule="ref_partial")
+        over = ctx.cash_c > sum(self._signed(i) for i in open_inv + credits) + 1
+        return self._why(txn, "cash_above_cited_not_completed" if over else "settle_failed")
+
+    def _why(self, txn: str, reason: str) -> None:
+        """trace_ref: remember why the reference strategy gave up on this line."""
+        if FLAGS.trace_ref:
+            self.ref_why[txn] = reason
+        return None
+
+    def _corroborated(self, ids: list[str], strong: set[str], ctx: Ctx) -> list[str]:
+        """Weak citations (short suffixes) that agree with each other: the ONLY party with two
+        or more cited documents, or whose cited documents add up to the cash. One noisy suffix
+        can hit any customer; several hitting the same one is no coincidence."""
+        by_party: dict[str, list[str]] = defaultdict(list)
+        for i in ids:
+            if i not in strong:
+                by_party[self.book.items[i].party].append(i)
+        good = [
+            p
+            for p in sorted(by_party)
+            if len(by_party[p]) >= 2
+            or abs(sum(self._signed(i) for i in by_party[p]) - ctx.cash_c) <= 1
+        ]
+        return by_party[good[0]] if len(good) == 1 else []
 
     def _by_fuzzy_reference(
         self, r: dict, ctx: Ctx, text: str, parties: list[str], scope: set[str], receipt: bool
@@ -1308,6 +1359,15 @@ class Engine:
                     break
         if subsets:
             small = sorted(pool, key=lambda i: (self.book.items[i].issue,))[:25]
+            if FLAGS.complete_near and exclude:
+                # the uncited rest of a truncated citation is rarely the payer's oldest items:
+                # look at the open items closest in issue date to the cited ones
+                cited = sorted(_d(self.book.items[i].issue) for i in exclude)
+                anchor = cited[len(cited) // 2]
+                small = sorted(
+                    pool,
+                    key=lambda i: (abs((_d(self.book.items[i].issue) - anchor).days), i),
+                )[:25]
             for k in (1, 2, 3):
                 for sub in itertools.combinations(small, k):
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:

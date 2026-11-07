@@ -54,6 +54,13 @@ def main() -> None:
     ph = load_window(Path(a.data), a.start, a.end)
     eng = Engine(ph, cache_dir=Path("out/cache"), category_model=_category_model(Path(a.data), ph.name, a.start))
     results = eng.run()
+    if getattr(eng, "ref_why", None):
+        import csv
+
+        with open(folder / "trace_ref.csv", "w", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["bank_txn_id", "reason"])
+            w.writerows(sorted(eng.ref_why.items()))
     sub = folder / "submission.csv.gz"
     write_csv(results, sub)
     write_explain(results, folder / "explain.csv.gz")

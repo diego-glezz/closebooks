@@ -290,7 +290,8 @@ def test_flags_defaults():
     from closebooks.bankrec.variants import Flags
 
     f = Flags()
-    assert f.two_pass_party and f.ref_cn_subset  # the two switches ON after measuring them
+    assert f.two_pass_party and f.ref_cn_subset and f.ref_po  # ON after measuring them
+    assert not any((f.ref_corroborate, f.ref_trust_other, f.complete_near, f.trace_ref))
     assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
     assert (f.exact_recent_days, f.stale_days) == (0, 0)
     assert (f.subset_recent_days, f.subset_cap, f.subset_max_items) == (240, 22, 5)
@@ -349,3 +350,24 @@ def test_pdf_clauses_never_touch_invoices_issued_after_the_pdf(monkeypatch):
     assert eng.Engine._pdf_items(fake, "RE250104461", "AR", "ES01", "2025-07-02") == [
         "ARI-2025-0000001"
     ]
+
+
+def test_weak_citations_are_accepted_only_when_they_agree_on_one_party():
+    """ref_corroborate: two short suffixes of the same customer are no coincidence; one suffix of
+    each of two customers is."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-0516064", 40000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-0519411", 25000, "2025-04-03"),
+        ("ARI-2025-0000003", "FV25-0777777", 31000, "2025-04-05"),
+    )
+    b.items["ARI-2025-0000003"].party = "C2"
+    engine, fake = _fake_engine(b)
+    one, two, other = "ARI-2025-0000001", "ARI-2025-0000002", "ARI-2025-0000003"
+    # C1 has two cited documents, C2 only one: C1 is corroborated
+    assert engine._corroborated(fake, [one, two, other], set(), ctx(65000)) == [one, two]
+    # one weak suffix per customer and no amount agreement: nothing is corroborated
+    assert engine._corroborated(fake, [one, other], set(), ctx(99999)) == []
+    # a single weak suffix whose amount IS the cash is enough
+    assert engine._corroborated(fake, [one, other], set(), ctx(31000)) == [other]
+    # strong citations are not part of the vote
+    assert engine._corroborated(fake, [one, two], {one, two}, ctx(65000)) == []
