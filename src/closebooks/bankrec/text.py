@@ -137,6 +137,31 @@ def text_tokens(text: str | None) -> set[str]:
     return {k for k in out if len(k) >= 5}
 
 
+def token_positions(text: str | None) -> list[tuple[int, set[str]]]:
+    """(position, keys) of every reference token of a bank text, in reading order (same keys as
+    text_tokens), to know in which order the documents are cited."""
+    if not text:
+        return []
+    t = _AMOUNT.sub(" ", fold(text))
+    out: list[tuple[int, set[str]]] = []
+    for m in _TOKEN.finditer(t):
+        tok = m.group()
+        keys: set[str] = set()
+        a = _NON_ALNUM.sub("", tok)
+        if len(a) >= 5:
+            keys.add(a)
+            digits = "".join(_DIGITS.findall(a))
+            if len(digits) >= 5:
+                keys |= {digits, digits.lstrip("0") or "0"}
+        for d in _DIGITS.findall(tok):
+            if len(d) >= 5:
+                keys |= {d, d.lstrip("0") or "0"}
+        keys = {k for k in keys if len(k) >= 5}
+        if keys:
+            out.append((m.start(), keys))
+    return out
+
+
 MONTHS = {
     "ENE": 1,
     "ENERO": 1,

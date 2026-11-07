@@ -138,15 +138,17 @@ def settle(
     fx: FX,
     terms: dict[str, tuple[float, int]],
     allow_partial: bool = True,
+    order: list[str] | None = None,
 ) -> list[Alloc] | None:
     """Split the cash of a bank line over a set of items following POLICIES §2-3.
     Returns None if the cash cannot be explained by these items (caller tries something else).
+    `order` (PARTIAL only): items cleared in full in that order, the remainder on the last one.
 
     POLICIES §3 FX_DIFFERENCE: when the bank line is in a different currency than the invoices,
     every fully cleared invoice row carries FX_DIFFERENCE, replacing an empty exception,
     SHORT_DISCOUNT, SHORT_WITHHOLDING or SHORT_BANK_CHARGES (PARTIAL / SHORT_DISPUTE keep their
     code, credit-note rows stay empty)."""
-    res = _settle(book, ids, ctx, fx, terms, allow_partial)
+    res = _settle(book, ids, ctx, fx, terms, allow_partial, order)
     if res and ids and book.items[ids[0]].ccy != ctx.ccy:
         res = [
             Alloc(a.item, a.amount_c, "FX_DIFFERENCE")
@@ -164,6 +166,7 @@ def _settle(
     fx: FX,
     terms: dict[str, tuple[float, int]],
     allow_partial: bool = True,
+    order: list[str] | None = None,
 ) -> list[Alloc] | None:
     if not ids:
         return None
@@ -246,10 +249,32 @@ def _settle(
             return full("SHORT_BANK_CHARGES")
     if not allow_partial:
         return None
-    # PARTIAL: oldest items cleared in full, the remainder on the last one
+    # ONE of several invoices took its early-payment discount (POLICIES §3): within terms it is
+    # SHORT_DISCOUNT (fully cleared); after the deadline the discount is not accepted -> PARTIAL
+    # on THAT invoice for total - discount, the others cleared in full without exception.
+    # Only for callers that pass a citation `order` (ref_partial_v2).
+    if order is not None and len(invoices) > 1:
+        hits = [
+            (it, d, w)
+            for (it, d, w), (_, o) in zip(discs, invoices, strict=True)
+            if d and d < o and abs(diff - d) <= tol
+        ]
+        if len(hits) == 1:
+            hit_it, d, w = hits[0]
+            return [
+                Alloc(it.id, o, "")
+                if it.id != hit_it.id
+                else (Alloc(it.id, o, "SHORT_DISCOUNT") if w else Alloc(it.id, o - d, "PARTIAL"))
+                for it, o in invoices
+            ] + [Alloc(it.id, o, "") for it, o in credits]
+    # PARTIAL: items cleared in full in the order given (default: oldest first), the remainder
+    # on the last one
     out: list[Alloc] = [Alloc(it.id, o, "") for it, o in credits]
     remaining = cash + sum(o for _, o in credits)
-    inv_sorted = sorted(invoices, key=lambda x: (x[0].issue, x[0].number))
+    rank = {iid: k for k, iid in enumerate(order or ())}
+    inv_sorted = sorted(
+        invoices, key=lambda x: (rank.get(x[0].id, len(rank)), x[0].issue, x[0].number)
+    )
     for k, (it, o) in enumerate(inv_sorted):
         if remaining <= 0:
             break

@@ -44,7 +44,7 @@ from closebooks.bankrec.rules import (
     subset_solutions,
     unique_subset,
 )
-from closebooks.bankrec.text import alnum, fold, service_month, text_tokens
+from closebooks.bankrec.text import alnum, fold, service_month, text_tokens, token_positions
 from closebooks.bankrec.variants import FLAGS
 
 AP_FACTORY = {"ES00": {"ES00", "ES01", "ES02", "PT01"}}
@@ -53,6 +53,14 @@ PARTIAL_SHARES = (0.25, 0.3, 0.4, 0.5, 0.6, 0.7)
 _MANDATE = re.compile(r"VTM-?[A-Z]{2}-?\d{4,}")
 _CHEQUE = re.compile(r"(?:CHK|CHQ|CHEQUE|CHECK)\.?\s*(?:N[O0]\.?\s*)?(\d{5,})")
 _CARD = re.compile(r"\*{2,}(\d{4})")
+# instalment "k/n" of a plan in the bank text (TRAIN: k = n is never PARTIAL, k < n always is)
+_INSTALMENT_RX = re.compile(
+    r"(?:INSTAL|PLAZO|VTO|VENC|CUOTA|RATA|RATE|ECHEANCE|TEILZ|PARCELA)[A-Z]*\.?\s*"
+    r"(\d{1,2})\s*/\s*(\d{1,2})(?!\d)"
+)
+# the payment of what was left open: last instalment or the settlement of a disputed amount
+# (TRAIN: single-invoice "SETTLEMENT" lines are never PARTIAL)
+_REMAINDER_RX = re.compile(r"\bSETTLEMENT\b|" + _INSTALMENT_RX.pattern)
 
 
 @dataclass
@@ -1297,11 +1305,64 @@ class Engine:
                     )
                     if res:
                         return Result(r["bank_txn_id"], res, rule="ref_subset")
-        res = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
+        res = self._ref_partial(r, ctx, text, open_inv)
         if res:
-            return Result(r["bank_txn_id"], res, rule="ref_partial")
+            return res
         over = ctx.cash_c > sum(self._signed(i) for i in open_inv + credits) + 1
         return self._why(txn, "cash_above_cited_not_completed" if over else "settle_failed")
+
+    def _ref_partial(self, r: dict, ctx: Ctx, text: str, open_inv: list[str]) -> Result | None:
+        """Last resort of the reference strategy: the cited invoices explain only part of the
+        cash. POLICIES §3: one late-discounted invoice is PARTIAL for total - discount (the others
+        full); otherwise the customer pays the invoices in the order it cites them and the
+        remainder (PARTIAL) falls on the LAST cited one (TRAIN: 227/252 n-to-m lines, vs ~50 %
+        for "newest invoice"). The remainder of an instalment plan (last instalment "k/k") or of
+        a dispute ("SETTLEMENT") clears the item without exception."""
+        txn = r["bank_txn_id"]
+        base = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
+        if not base:
+            return None
+        if not FLAGS.ref_partial_v2:
+            return Result(txn, base, rule="ref_partial")
+        if len(open_inv) > 1:
+            order = self._cite_order(text, open_inv)
+            res = settle(
+                self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True, order=order
+            )
+            if not res or res == base:
+                return Result(txn, base, rule="ref_partial")
+            disc = any(
+                a.exception == "SHORT_DISCOUNT"
+                or (a.exception == "PARTIAL" and self._late_discount_share(a, ctx))
+                for a in res
+            )
+            return Result(txn, res, rule="ref_partial_discount" if disc else "ref_partial_cited")
+        a = base[0]
+        if a.exception == "PARTIAL" and _REMAINDER_RX.search(fold(text)):
+            m = _INSTALMENT_RX.search(fold(text))
+            last = m is None or int(m.group(1)) == int(m.group(2))
+            if last:
+                fx_line = self.book.items[a.item].ccy != ctx.ccy
+                exc = "FX_DIFFERENCE" if fx_line else ""
+                return Result(txn, [Alloc(a.item, a.amount_c, exc)], rule="ref_partial_remainder")
+        return Result(txn, base, rule="ref_partial")
+
+    def _late_discount_share(self, a: Alloc, ctx: Ctx) -> bool:
+        """The PARTIAL amount is the invoice open amount minus its early-payment discount."""
+        d, _ = discount_c(self.book.items[a.item], self.terms, ctx.booking)
+        return bool(d) and abs(self.book.open[a.item] - d - a.amount_c) <= 1
+
+    def _cite_order(self, text: str, ids: list[str]) -> list[str]:
+        """`ids` sorted by the position of their LAST citation in the bank text (uncited last)."""
+        want = set(ids)
+        pos: dict[str, int] = {}
+        for p, keys in token_positions(text):
+            for k in sorted(keys):
+                for iid in self.book.lookup(k):
+                    key = self.book.replaced_by.get(iid, iid)
+                    if key in want:
+                        pos[key] = p
+        return sorted(pos, key=lambda i: (pos[i], i))
 
     def _why(self, txn: str, reason: str) -> None:
         """trace_ref: remember why the reference strategy gave up on this line."""

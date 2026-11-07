@@ -326,6 +326,64 @@ def test_partial_payment_keeps_cash_amount():
     assert (a[0].amount_c, a[0].exception) == (20562, "PARTIAL")
 
 
+def test_partial_remainder_on_last_cited_invoice():
+    # the customer cites the newer invoice first: the older one (cited last) keeps the remainder
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 50000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-2", 80000, "2025-05-01"),
+    )
+    ids = ["ARI-2025-0000001", "ARI-2025-0000002"]
+    old = {a.item: (a.amount_c, a.exception) for a in settle(b, ids, ctx(100000), FX_RATES, TERMS)}
+    assert old["ARI-2025-0000002"] == (50000, "PARTIAL")  # default: oldest first
+    order = ["ARI-2025-0000002", "ARI-2025-0000001"]
+    got = {
+        a.item: (a.amount_c, a.exception)
+        for a in settle(b, ids, ctx(100000), FX_RATES, TERMS, order=order)
+    }
+    assert got == {"ARI-2025-0000002": (80000, ""), "ARI-2025-0000001": (20000, "PARTIAL")}
+
+
+def test_late_discount_on_one_of_several_invoices():
+    # POLICIES §3: discount after the deadline on ONE invoice -> PARTIAL total - 2 % on THAT one
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 95638, "2025-04-01", "D2N30"),
+        ("ARI-2025-0000002", "FV25-2", 13952, "2025-04-02", "D2N30"),
+        ("ARI-2025-0000003", "FV25-3", 30000, "2025-04-03", "D2N30"),
+    )
+    ids = ["ARI-2025-0000001", "ARI-2025-0000002", "ARI-2025-0000003"]
+    cash = 95638 + 13952 + 30000 - 1913  # 2 % of 956.38 = 19.13
+    got = {
+        a.item: (a.amount_c, a.exception)
+        for a in settle(b, ids, ctx(cash, "2025-06-10"), FX_RATES, TERMS, order=[])
+    }
+    assert got == {
+        "ARI-2025-0000001": (95638 - 1913, "PARTIAL"),
+        "ARI-2025-0000002": (13952, ""),
+        "ARI-2025-0000003": (30000, ""),
+    }
+    # within terms the same shortfall is SHORT_DISCOUNT on that invoice, fully cleared
+    got = {
+        a.item: (a.amount_c, a.exception)
+        for a in settle(b, ids, ctx(cash, "2025-04-08"), FX_RATES, TERMS, order=[])
+    }
+    assert got["ARI-2025-0000001"] == (95638, "SHORT_DISCOUNT")
+
+
+def test_token_positions_and_last_instalment_regex():
+    from closebooks.bankrec.engine import _INSTALMENT_RX, _REMAINDER_RX
+    from closebooks.bankrec.text import fold, token_positions
+
+    pos = token_positions("INVOICE 1142427584 421396 | RMR*IV*421396*PI*2384.68")
+    firsts = [p for p, keys in pos if "1142427584" in keys]
+    lasts = [p for p, keys in pos if "421396" in keys]
+    assert firsts and lasts and max(lasts) > max(firsts)
+    m = _INSTALMENT_RX.search(fold("INSTALMENT 3/3 PAYMENT INV INV24-0323480"))
+    assert m and m.group(1) == m.group(2) == "3"
+    assert _INSTALMENT_RX.search(fold("BONIFICO CAUSALE RATA 1/3 FT21-01-03810")).group(1) == "1"
+    assert _REMAINDER_RX.search(fold("SETTLEMENT INV# 1062428331"))
+    assert not _REMAINDER_RX.search(fold("PAGO A CUENTA FV25-0012345"))
+
+
 # ---------------------------------------------------------------- added after TRAIN analysis
 
 

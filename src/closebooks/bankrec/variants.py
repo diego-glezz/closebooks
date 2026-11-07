@@ -48,6 +48,9 @@ class Flags:
     # cited invoices paid net of a SUBSET of the party's credit notes; ON since 7 nov
     # (DEV 85.99 -> 86.06, HOLDOUT 85.68 -> 85.75, pair precision 0.92 / 0.97)
     ref_cn_subset: bool = True
+    # ref_partial: late discount on ONE invoice, remainder on the LAST cited invoice, last
+    # instalment / dispute settlement without exception (role C, 7 nov)
+    ref_partial_v2: bool = True
     pdf_exact: bool = False  # PDF clauses only apply to the item with the exact printed number
     pdf_dated: bool = False  # PDF clauses never touch items issued after the PDF's own date
 
