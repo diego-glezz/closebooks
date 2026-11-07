@@ -829,6 +829,11 @@ class Engine:
             for row in payload:
                 amt = abs(round(float(row["document_amount"]) * 100))
                 sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
+                iban_known = bool(sup)
+                if not sup and row.get("beneficiary"):
+                    # aggregated files often leave the IBAN empty: the beneficiary NAME still
+                    # says which supplier it is (supplier numbers repeat across suppliers)
+                    sup = self._suppliers_named(row["beneficiary"], ents)
                 ids: list[str] = []
                 for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
                     ids += [
@@ -838,22 +843,28 @@ class Engine:
                         )
                         if i not in self.book.cancelled and i not in ids
                     ]
-                if not ids and not sup:  # unknown beneficiary IBAN: any supplier's document
+                if not ids and not iban_known:  # unknown beneficiary IBAN: any supplier's doc
                     ids = self.book.find_number(row["document_number"], side="AP", entities=ents)
                 if ids:
                     cands.append((row, amt, ids))
+
             # supplier numbers repeat across suppliers: prefer the supplier that owns most of
-            # the documents of this transfer (decided on the exact-amount matches)
+            # the documents paid to the SAME beneficiary (decided on the exact-amount matches);
+            # an aggregated file pays hundreds of beneficiaries, so a run-wide vote means nothing
+            def bkey(row: dict) -> str:
+                return alnum(row.get("beneficiary_iban")) or fold(row.get("beneficiary") or "")
+
             votes = Counter(
-                self.book.items[i].party
-                for _r, a, ids in cands
+                (bkey(rw), self.book.items[i].party)
+                for rw, a, ids in cands
                 for i in ids
                 if abs(self.book.items[i].total - a) <= 1
             )
-            for _row, amt, ids in cands:
+            for row, amt, ids in cands:
+                b = bkey(row)
                 ids.sort(
-                    key=lambda i: (
-                        -votes.get(self.book.items[i].party, 0),
+                    key=lambda i, b=b: (
+                        -votes.get((b, self.book.items[i].party), 0),
                         self.book.open[i] == 0,
                         abs(self.book.items[i].total - amt),
                         i,
@@ -875,6 +886,13 @@ class Engine:
         if kind == "advice":
             return self._from_advice(r, ctx, payload)
         return None
+
+    def _suppliers_named(self, name: str, entities: set[str]) -> list[str]:
+        """Suppliers whose name best matches `name` (all of those tied on the best score)."""
+        ranked = self.parties.by_name(name, entities)
+        if not ranked:
+            return []
+        return sorted(p for p, s in ranked if s == ranked[0][1])
 
     def _item_for(
         self,
