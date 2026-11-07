@@ -123,7 +123,9 @@ class Book:
     def apply(self, txn: str, iid: str, amount_c: int, exception: str) -> None:
         """Record an allocation. Fully-clearing exceptions close the item."""
         if exception == "RETURNED":
-            self.open[iid] += amount_c
+            # re-opens what the original allocation cleared; never beyond the document (a window
+            # that starts after the original payment has no history of it)
+            self.open[iid] = min(self.items[iid].total, self.open[iid] + amount_c)
             return
         if exception in (
             "SHORT_DISCOUNT",

@@ -36,6 +36,7 @@ from closebooks.bankrec.rules import (
     Ctx,
     category_by_text,
     deduction_kind,
+    deduction_kind_by_amount,
     discount_c,
     duplicate_refund_category,
     settle,
@@ -219,12 +220,22 @@ class Engine:
         due_by_number: dict[tuple[str, str], str] = {}
         for _, row in conf.drop_duplicates(["beneficiary_iban", "document_number"]).iterrows():
             sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
-            ids = self.book.find_number(
-                row["document_number"], party=sup[0] if sup else None, side="AP"
-            )
-            if ids:
+            amt = abs(int(row["doc_c"]))
+            ids: list[str] = []
+            for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
+                ids += [
+                    i
+                    for i in self.book.find_number(row["document_number"], party=p, side="AP")
+                    if i not in ids
+                ]
+            # the maturity is set by the invoices of the transfer: a credit note (its due is its
+            # issue date) or an approximate number match must not move it
+            invoices = [i for i in ids if not self.book.items[i].is_credit]
+            exact = [i for i in invoices if abs(self.book.items[i].total - amt) <= 1]
+            pick = exact or invoices[:1]
+            if pick:
                 due_by_number[(row["beneficiary_iban"], row["document_number"])] = self.book.items[
-                    ids[0]
+                    pick[0]
                 ].due
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for _e2e, g in conf.groupby("end_to_end_id"):
@@ -524,7 +535,7 @@ class Engine:
         if learned:
             exc = "UNIDENTIFIED" if learned == "UNIDENTIFIED" else ""
             return Result(txn, category=learned, exception=exc, rule="category_learned")
-        cat = category_by_text(text)
+        cat = category_by_text(text, receipt)
         if cat and cat != "BANK_FEES" and not RETURN_RX.search(ftext):
             return Result(txn, category=cat, rule="category_text")
         if cat == "BANK_FEES" and (
@@ -704,7 +715,18 @@ class Engine:
                 return ids[0]
         if not party and name:
             ps = self.parties.by_name(name, {ent})
-            party = ps[0][0] if ps else None
+            tied = [p for p, score in ps if score == ps[0][1]] if ps else []
+            if len(tied) > 1:
+                # several customers match the name equally well: take the document only if
+                # exactly one of them has an open item for exactly this amount
+                hits = [
+                    iid
+                    for p in tied
+                    for iid in self.book.open_items(p, booking, side)
+                    if abs(self.book.open[iid] - amt) <= 1
+                ]
+                return hits[0] if len(hits) == 1 else None
+            party = tied[0] if tied else None
         if party:
             for iid in self.book.open_items(party, booking, side):
                 if abs(self.book.open[iid] - amt) <= 1:
@@ -717,6 +739,7 @@ class Engine:
         fam: set[str] = set()
         for p, _ in ps[:2]:
             fam |= self.parties.family(p)
+        payer_country = self.parties.country.get(ps[0][0], "") if ps else ""
         allocs: list[Alloc] = []
         for ln in adv.lines:
             ids = [
@@ -742,7 +765,13 @@ class Engine:
             it = self.book.items[iid]
             paid = abs(ln.paid)
             open_c = self.book.open[iid] or it.total
-            kind = deduction_kind(ln.reason) if ln.deduction_c else ""
+            kind = ""
+            if ln.deduction_c:
+                kind = (
+                    deduction_kind(ln.reason)
+                    if ln.reason.strip()
+                    else deduction_kind_by_amount(it, ln.deduction_c, self.terms, payer_country)
+                )
             if it.is_credit:
                 allocs.append(Alloc(iid, open_c, ""))
             elif kind == "discount":
