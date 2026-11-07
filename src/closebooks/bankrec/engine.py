@@ -117,6 +117,7 @@ class Engine:
         self.ref_why: dict[str, str] = {}  # trace_ref: txn -> why _by_reference gave up
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
+        self.restored_advance: set[str] = set()  # carried items whose advance was re-opened
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
         step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
@@ -163,6 +164,14 @@ class Engine:
                     if old != new:
                         self.book.cancelled.add(old)
                         self.book.replaced_by[old] = new
+            # LIVE/FINAL opening balances (open_items_at_start) already net the proforma advance
+            # off the invoice, but the golden never applies it: the payment of the net amount is
+            # PARTIAL (POLICIES §3) and the advance stays open. Restore the full balance, as a
+            # TRAIN window (balances rebuilt from the golden) sees it.
+            item = self.book.items[new]
+            if c.advance and c.payable_c and self.book.open.get(new) == c.payable_c < item.total:
+                self.book.open[new] = item.total
+                self.restored_advance.add(new)
             if c.instalments or c.payable_c:
                 self.plan[new] = sorted(
                     set(c.instalments) | ({c.payable_c} if c.payable_c else set())
