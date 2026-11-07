@@ -251,6 +251,11 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
         r"IMPUESTOS|AEAT|MOD\.? ?\d{3}|HACIENDA|DGFIP|FINANZAMT|TAX PAYMENT|IMPOTS|TVA |IRS |SAT ",
         "TAX_PAYMENT",
     ),
+    (
+        # before the loans: "PRESTAMO INTRAGRUPO" is intercompany financing (POLICIES §4)
+        r"INTERCOMPANY|INTRAGRUPO|FINANCIACION (?:GRUPO|IC)\b|INTRAGROUPE|KONZERN",
+        "INTERCOMPANY",
+    ),
     (r"LEASING|RENTING|CREDIT[- ]BAIL", "LEASING"),
     (
         r"DISPOSICION (?:PRESTAMO|POLIZA)|LOAN DRAWDOWN|DEBLOCAGE PRET|KREDITAUSZAHLUNG",
@@ -281,16 +286,33 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
         r"TRASPASO|TRANSFER BETWEEN OWN|VIREMENT INTERNE|UMBUCHUNG|INTERNAL TRANSFER",
         "INTERNAL_TRANSFER",
     ),
-    (
-        r"INTERCOMPANY|INTRAGRUPO|PRESTAMO INTRAGRUPO|FINANCIACION GRUPO|INTRAGROUPE|KONZERN",
-        "INTERCOMPANY",
-    ),
 ]
 _COMPILED = [(re.compile(p), c) for p, c in _CATEGORY_RULES]
 
+# Categories that depend on the sign of the line (POLICIES §4). Each pattern holds 100 % of the
+# labelled lines in TRAIN: a receipt that pays a proforma is a customer advance; a debit that
+# refunds a duplicate payment is a customer refund; a receipt "pago doble" is a supplier refund.
+# ("REEMBOLSO <nº>" is not here: it can settle a supplier credit note, an item.)
+_RECEIPT_RULES = [
+    (re.compile(r"PROFORMA|\bPF\d{2}-\d"), "CUSTOMER_ADVANCE"),
+    (re.compile(r"PAGO DOBLE|DOBLE PAGO|PAGO DUPLICADO"), "SUPPLIER_REFUND"),
+]
+_DEBIT_RULES = [
+    (
+        re.compile(r"REFUND DUPLICATE|DUPLICATE PAYMENT REFUND|DEVOLUCION PAGO DUPLICADO|PAGO DOBLE"),
+        "CUSTOMER_REFUND",
+    ),
+]
 
-def category_by_text(text: str) -> str | None:
+
+def category_by_text(text: str, receipt: bool | None = None) -> str | None:
+    """Category of a line that settles no item, from its text. `receipt` (money in) enables the
+    rules that depend on the sign of the line."""
     t = fold(text)
+    if receipt is not None:
+        for rx, cat in _RECEIPT_RULES if receipt else _DEBIT_RULES:
+            if rx.search(t):
+                return cat
     for rx, cat in _COMPILED:
         if rx.search(t):
             return cat

@@ -89,6 +89,28 @@ def test_categories():
     assert category_by_text("COMISION TRANSF. EXTERIOR") == "BANK_FEES"
 
 
+def test_intercompany_loan_is_intercompany_not_loan_repayment():
+    assert category_by_text("PRESTAMO INTRAGRUPO CUOTA") == "INTERCOMPANY"
+    assert category_by_text("CUOTA PRESTAMO HIPOTECARIO") == "LOAN_REPAYMENT"
+
+
+def test_sign_dependent_categories():
+    """POLICIES §4: proforma receipt -> advance; duplicate refund debit -> customer refund."""
+    pf = "SEPA-UEBERWEISUNG SVWZ+PROFORMA PF25-0123 RHEI9"
+    assert category_by_text(pf, receipt=True) == "CUSTOMER_ADVANCE"
+    assert category_by_text("ACH CREDIT X CCD RMR*IV*PF25-0123*PI*10.00", receipt=True) == (
+        "CUSTOMER_ADVANCE"
+    )
+    assert category_by_text(pf) is None  # without the sign nothing is decided
+    assert category_by_text(pf, receipt=False) is None  # a debit naming a proforma is not one
+    dup = "ACH DEBIT LAKE HARMON POOL VENDOR PMT HPNB REFUND DUPLICATE PAYMENT 123"
+    assert category_by_text(dup, receipt=False) == "CUSTOMER_REFUND"
+    assert category_by_text(dup, receipt=True) is None
+    assert category_by_text("SVWZ+ABONO PAGO DOBLE RHEI", receipt=True) == "SUPPLIER_REFUND"
+    # "REEMBOLSO <nº>" may settle a supplier credit note: never a category by text alone
+    assert category_by_text("SVWZ+REEMBOLSO FV-25-123 RHEI", receipt=True) is None
+
+
 # ---------------------------------------------------------------- documents
 
 

@@ -461,7 +461,7 @@ class Engine:
         if learned:
             exc = "UNIDENTIFIED" if learned == "UNIDENTIFIED" else ""
             return Result(txn, category=learned, exception=exc, rule="category_learned")
-        cat = category_by_text(text)
+        cat = category_by_text(text, receipt)
         if cat and cat != "BANK_FEES" and not RETURN_RX.search(ftext):
             return Result(txn, category=cat, rule="category_text")
         if cat == "BANK_FEES" and (
