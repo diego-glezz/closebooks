@@ -308,7 +308,9 @@ _RECEIPT_RULES = [
 ]
 _DEBIT_RULES = [
     (
-        re.compile(r"REFUND DUPLICATE|DUPLICATE PAYMENT REFUND|DEVOLUCION PAGO DUPLICADO|PAGO DOBLE"),
+        re.compile(
+            r"REFUND DUPLICATE|DUPLICATE PAYMENT REFUND|DEVOLUCION PAGO DUPLICADO|PAGO DOBLE"
+        ),
         "CUSTOMER_REFUND",
     ),
 ]
@@ -373,7 +375,7 @@ def deduction_kind_by_amount(
     the early-payment discount of the invoice terms, a tax withheld at source (POLICIES §3), or
     else a dispute. The discount may be taken late: it is still a discount (-> PARTIAL)."""
     ded = abs(deduction_c)
-    pct, _days_ = terms.get(it.terms, (0.0, 0))
+    pct, _ = terms.get(it.terms, (0.0, 0))
     if pct and not it.is_credit and abs(ded - round(it.total * pct / 100)) <= 1:
         return "discount"
     if payer_country in WITHHOLDING_COUNTRIES and any(
@@ -381,6 +383,65 @@ def deduction_kind_by_amount(
     ):
         return "withholding"
     return "dispute"
+
+
+def subset_solutions(
+    values: list[int], target: int, tol: int = 1, limit: int = 4000
+) -> list[list[int]] | None:
+    """Every non-empty subset (as sorted index lists) of `values` summing to within `tol` of
+    `target`, by meet-in-the-middle with numpy (fine up to ~32 values). None when there are more
+    than `limit` solutions: the amount is then too generic to say anything."""
+    import numpy as np
+
+    n = len(values)
+    if n == 0:
+        return []
+    h = n // 2
+
+    def sums(vals: list[int]):
+        s = np.zeros(1, dtype=np.int64)
+        m = np.zeros(1, dtype=np.int64)
+        for i, v in enumerate(vals):
+            s = np.concatenate([s, s + v])
+            m = np.concatenate([m, m | (1 << i)])
+        return s, m
+
+    ls, lm = sums(values[:h])
+    rs, rm = sums(values[h:])
+    order = np.argsort(rs, kind="stable")
+    rs, rm = rs[order], rm[order]
+    lo = np.searchsorted(rs, target - ls - tol, side="left")
+    hi = np.searchsorted(rs, target - ls + tol, side="right")
+    cnt = hi - lo
+    if int(cnt.sum()) > limit:
+        return None
+    out: list[list[int]] = []
+    for k in np.nonzero(cnt)[0]:
+        ml = int(lm[k])
+        for j in range(int(lo[k]), int(hi[k])):
+            mr = int(rm[j])
+            if ml or mr:
+                out.append(
+                    [i for i in range(h) if ml >> i & 1]
+                    + [h + i for i in range(n - h) if mr >> i & 1]
+                )
+    return out
+
+
+def fifo_pick(solutions: list[list[int]], max_holes: int) -> list[int] | None:
+    """Among subsets of a FIFO-ordered pool, the one closest to a prefix: fewest older items left
+    unpaid (holes). Must be the unique best and within `max_holes`; otherwise abstain (None)."""
+    best: list[tuple[int, list[int]]] = []
+    for sol in solutions:
+        holes = max(sol) + 1 - len(sol)
+        if holes <= max_holes:
+            best.append((holes, sol))
+    if not best:
+        return None
+    best.sort(key=lambda t: (t[0], t[1]))
+    if len(best) > 1 and best[1][0] == best[0][0]:
+        return None
+    return best[0][1]
 
 
 def unique_subset(

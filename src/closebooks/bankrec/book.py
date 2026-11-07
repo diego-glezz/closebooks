@@ -159,6 +159,10 @@ class Parties:
         self.group_members: dict[str, set[str]] = defaultdict(set)
         self.names: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
         # entity -> first word -> {"FULL KEY|party"}
+        self._learned: dict[str, str] = {}
+        self._shared: set[str] = set()
+        self._words: dict[str, dict[str, set[str]]] | None = None
+        self._key_words: dict[str, list[str]] = {}
         for df, kind in ((customers, "C"), (suppliers, "S")):
             for r in df.to_dict("records"):
                 pid = r["customer_id"] if kind == "C" else r["supplier_id"]
@@ -186,9 +190,82 @@ class Parties:
             return
         first = key.split()[0]
         self.names[entity][first].add(f"{key}|{pid}")
+        known = self._key_words.setdefault(pid, [])
+        for w in key.split():
+            if w not in known:
+                known.append(w)
 
     def add_iban(self, iban: str, pid: str) -> None:
         self.by_iban[alnum(iban)].add(pid)
+
+    def learn_iban(self, iban: str, pid: str) -> None:
+        """Remember the account of a payer that a reference identified without doubt.
+
+        An account seen paying for two unrelated families is an intermediary (confirming bank,
+        factor, agency): it is dropped for good, so it never points to a single customer."""
+        iban = alnum(iban)
+        if not iban or iban in self._shared:
+            return
+        if iban in self._learned:
+            if pid not in self.family(self._learned[iban]):
+                self._shared.add(iban)
+                self._learned.pop(iban)
+                self.by_iban.pop(iban, None)
+            return
+        if iban in self.by_iban:  # master data wins
+            return
+        self._learned[iban] = pid
+        self.by_iban[iban].add(pid)
+
+    def _word_index(self) -> dict[str, dict[str, set[str]]]:
+        """entity -> word -> {party}: any word of any known name (for out-of-order matches)."""
+        if self._words is None:
+            self._words = defaultdict(lambda: defaultdict(set))
+            self._near: dict[tuple[str, str], set[str]] = defaultdict(set)
+            for ent, firsts in self.names.items():
+                for cands in firsts.values():
+                    for c in cands:
+                        key, pid = c.split("|")
+                        for w in key.split():
+                            if len(w) >= 5:
+                                self._words[ent][w].add(pid)
+                            if len(w) >= 7:
+                                # one edit leaves the first or the last 3 letters untouched
+                                self._near[(ent, "^" + w[:3])].add(w)
+                                self._near[(ent, "$" + w[-3:])].add(w)
+        return self._words
+
+    def fuzzy_names(self, text: str, entities: set[str]) -> list[tuple[str, int]]:
+        """Fallback when no name matched as a prefix: every distinctive word of a known name
+        appears in the text (any order), or the first word has a single typo."""
+        ws = [w for w in words(text) if w not in LEGAL_SUFFIXES and len(w) >= 5]
+        if not ws:
+            return []
+        index = self._word_index()
+        found: dict[str, set[str]] = defaultdict(set)
+        for ent in sorted(entities):
+            table = index.get(ent, {})
+            for w in set(ws):
+                for pid in table.get(w, ()):
+                    found[pid].add(w)
+                if len(w) >= 7:  # one substituted / dropped / added letter
+                    near = self._near.get((ent, "^" + w[:3]), set()) | self._near.get(
+                        (ent, "$" + w[-3:]), set()
+                    )
+                    for cand in sorted(near):
+                        if cand != w and abs(len(cand) - len(w)) <= 1 and _one_edit(cand, w):
+                            for pid in table[cand]:
+                                found[pid].add(cand)
+        best: dict[str, int] = {}
+        for pid, hit in found.items():
+            key_words = [w for w in self._key_words.get(pid, ()) if len(w) >= 5]
+            if not key_words:
+                continue
+            covered = sum(1 for w in key_words if w in hit)
+            # all distinctive words, and at least 2 of them unless the name has a single one
+            if covered == len(key_words) and (covered >= 2 or len(key_words[0]) >= 9):
+                best[pid] = sum(len(w) for w in hit)
+        return sorted(best.items(), key=lambda x: (-x[1], x[0]))
 
     def family(self, pid: str) -> set[str]:
         """The party plus subsidiaries it may pay for (parent) and group members."""
@@ -223,6 +300,18 @@ class Parties:
                     if (n == len(key) or truncated_ok) and score > best.get(pid, 0):
                         best[pid] = score
         return sorted(best.items(), key=lambda x: (-x[1], x[0]))
+
+
+def _one_edit(a: str, b: str) -> bool:
+    """True when a and b differ by one substitution, insertion or deletion."""
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b, strict=True)) == 1
+    if len(a) > len(b):
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i:] == b[i + 1 :]
 
 
 def _common_prefix(a: str, b: str) -> int:

@@ -1,4 +1,4 @@
-"""Unit tests for text keys, advice parsing and the POLICIES exception rules (no data needed)."""
+﻿"""Unit tests for text keys, advice parsing and the POLICIES exception rules (no data needed)."""
 
 from __future__ import annotations
 
@@ -404,3 +404,112 @@ def test_name_matching_uses_same_normalization_on_both_sides():
     sup = pd.DataFrame(columns=["supplier_id", "entity", "name", "country", "iban"])
     p = Parties(cust, sup, {})
     assert p.by_name("ACH CREDIT POOL & SPA KING E HIJOS CCD", {"US01"})[0][0] == "C1"
+
+
+# ---------------------------------------------------------------- role B: FIFO subset
+
+
+def test_subset_solutions_finds_every_subset_within_tolerance():
+    from closebooks.bankrec.rules import subset_solutions
+
+    values = [100, 250, 300, 50, 400]
+    assert sorted(subset_solutions(values, 450, tol=0)) == [[0, 2, 3], [3, 4]]
+    assert subset_solutions(values, 10_000) == []
+    assert subset_solutions([1] * 14, 7, tol=0, limit=10) is None  # 3432 solutions: too generic
+
+
+def test_fifo_pick_prefers_the_prefix_and_abstains_on_ties():
+    from closebooks.bankrec.rules import fifo_pick
+
+    # items are in FIFO order: [0, 1, 2] is a prefix (0 holes), [0, 2, 4] leaves 2 older unpaid
+    assert fifo_pick([[0, 2, 4], [0, 1, 2]], max_holes=2) == [0, 1, 2]
+    assert fifo_pick([[0, 2, 3], [0, 1, 3]], max_holes=2) is None  # 1 hole each: tie, abstain
+    assert fifo_pick([[0, 2, 3], [0, 1, 4]], max_holes=2) == [0, 2, 3]  # 1 hole beats 2
+    assert fifo_pick([[2, 5]], max_holes=2) is None  # 4 holes: too far from FIFO
+
+
+def test_flags_defaults():
+    from closebooks.bankrec.variants import Flags
+
+    f = Flags()
+    assert f.two_pass_party and f.ref_cn_subset and f.ref_po  # ON after measuring them
+    assert not any((f.ref_corroborate, f.ref_trust_other, f.complete_near, f.trace_ref))
+    assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
+    assert (f.exact_recent_days, f.stale_days) == (0, 0)
+    assert (f.subset_recent_days, f.subset_cap, f.subset_max_items) == (240, 22, 5)
+
+
+# ---------------------------------------------------------------- role-B switches
+
+
+def _fake_engine(book: Book):
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    fake = SimpleNamespace(book=book, fx=FX_RATES, terms=TERMS)
+    fake._signed = lambda i: Engine._signed(fake, i)
+    return Engine, fake
+
+
+def test_cited_invoices_paid_net_of_a_subset_of_credit_notes():
+    """ref_cn_subset: the shortfall is exactly ONE subset of the party's open credit notes."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 100000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-2", 50000, "2025-04-03"),
+        ("ARC-2025-0000003", "AB25-1", 7000, "2025-04-05"),
+        ("ARC-2025-0000004", "AB25-2", 2500, "2025-04-06"),
+        ("ARC-2025-0000005", "AB25-3", 900, "2025-04-07"),
+    )
+    engine, fake = _fake_engine(b)
+    cns = ["ARC-2025-0000003", "ARC-2025-0000004", "ARC-2025-0000005"]
+    inv = ["ARI-2025-0000001", "ARI-2025-0000002"]
+    got = engine._net_of_credits(fake, inv, cns, ctx(150000 - 7000 - 900))
+    assert {(a.item, a.amount_c, a.exception) for a in got} == {
+        ("ARI-2025-0000001", 100000, ""),
+        ("ARI-2025-0000002", 50000, ""),
+        ("ARC-2025-0000003", 7000, ""),
+        ("ARC-2025-0000005", 900, ""),
+    }
+    # no subset of the credit notes explains the shortfall: leave it to ref_partial
+    assert engine._net_of_credits(fake, inv, cns, ctx(150000 - 1234)) is None
+    # cash above the cited invoices: not this rule
+    assert engine._net_of_credits(fake, inv, cns, ctx(150100)) is None
+
+
+def test_pdf_clauses_never_touch_invoices_issued_after_the_pdf(monkeypatch):
+    """pdf_dated: a 2024 PDF must not reach this year's invoice through the noisy keys."""
+    from closebooks.bankrec import engine as eng
+
+    b = make_book(("ARI-2025-0000001", "RE250104461", 1000, "2025-06-26"))
+    _, fake = _fake_engine(b)
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", False)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == [
+        "ARI-2025-0000001"
+    ]
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", True)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == []
+    assert eng.Engine._pdf_items(fake, "RE250104461", "AR", "ES01", "2025-07-02") == [
+        "ARI-2025-0000001"
+    ]
+
+
+def test_weak_citations_are_accepted_only_when_they_agree_on_one_party():
+    """ref_corroborate: two short suffixes of the same customer are no coincidence; one suffix of
+    each of two customers is."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-0516064", 40000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-0519411", 25000, "2025-04-03"),
+        ("ARI-2025-0000003", "FV25-0777777", 31000, "2025-04-05"),
+    )
+    b.items["ARI-2025-0000003"].party = "C2"
+    engine, fake = _fake_engine(b)
+    one, two, other = "ARI-2025-0000001", "ARI-2025-0000002", "ARI-2025-0000003"
+    # C1 has two cited documents, C2 only one: C1 is corroborated
+    assert engine._corroborated(fake, [one, two, other], set(), ctx(65000)) == [one, two]
+    # one weak suffix per customer and no amount agreement: nothing is corroborated
+    assert engine._corroborated(fake, [one, other], set(), ctx(99999)) == []
+    # a single weak suffix whose amount IS the cash is enough
+    assert engine._corroborated(fake, [one, other], set(), ctx(31000)) == [other]
+    # strong citations are not part of the vote
+    assert engine._corroborated(fake, [one, two], {one, two}, ctx(65000)) == []
