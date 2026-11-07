@@ -293,6 +293,18 @@ def test_deduction_without_reason_is_classified_by_amount():
     assert deduction_kind_by_amount(plain.items["ARI-2025-0000002"], -2000, TERMS, "ES") == "dispute"
 
 
+def test_returned_never_reopens_more_than_the_document():
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20"))
+    iid = "ARI-2025-0000001"
+    # window that starts after the original payment: the item is still open for its total
+    book.apply("BT-RET", iid, 100000, "RETURNED")
+    assert book.open[iid] == 100000
+    book.apply("BT-PAY", iid, 100000, "")
+    assert book.open[iid] == 0
+    book.apply("BT-RET2", iid, 100000, "RETURNED")  # with history it does re-open the amount
+    assert book.open[iid] == 100000
+
+
 def test_pdf_payment_plans():
     c = parse_clauses(
         "Forma de pago: 3 vencimientos a 60/90/120 dias (642,98 / 642,98 / 642,99 EUR)."

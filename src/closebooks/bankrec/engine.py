@@ -640,7 +640,18 @@ class Engine:
                 return ids[0]
         if not party and name:
             ps = self.parties.by_name(name, {ent})
-            party = ps[0][0] if ps else None
+            tied = [p for p, score in ps if score == ps[0][1]] if ps else []
+            if len(tied) > 1:
+                # several customers match the name equally well: take the document only if
+                # exactly one of them has an open item for exactly this amount
+                hits = [
+                    iid
+                    for p in tied
+                    for iid in self.book.open_items(p, booking, side)
+                    if abs(self.book.open[iid] - amt) <= 1
+                ]
+                return hits[0] if len(hits) == 1 else None
+            party = tied[0] if tied else None
         if party:
             for iid in self.book.open_items(party, booking, side):
                 if abs(self.book.open[iid] - amt) <= 1:
