@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -79,9 +80,16 @@ def _overpay_pattern(excess: int, total: int) -> bool:
 
 class Engine:
     def __init__(
-        self, ph: Phase, cache_dir: Path | None = None, category_model: Path | None = None
+        self,
+        ph: Phase,
+        cache_dir: Path | None = None,
+        category_model: Path | None = None,
+        on_step: Callable[[str], None] | None = None,
     ):
+        """`on_step(msg)` is called when each slow setup step starts (progress display only)."""
+        step = on_step or (lambda _msg: None)
         self.ph = ph
+        step("libro de partidas y terceros")
         m = ph.masters
         self.book = Book(ph.items)
         self.parties = Parties(m.customers, m.suppliers, self.book.items)
@@ -100,7 +108,9 @@ class Engine:
         self.linked: dict[str, tuple[str, object]] = {}
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
+        step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
+        step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
         self._link_details()
 
     # ================================================================ setup
@@ -1152,9 +1162,16 @@ class Engine:
 
     # ================================================================ run
 
-    def run(self) -> list[Result]:
+    def run(
+        self, progress: Callable[[int, int], None] | None = None, every: int = 1000
+    ) -> list[Result]:
+        """Process every bank line in booking order. `progress(done, total)` is called every
+        `every` lines and at the end (display only: it does not change any result)."""
         out = []
-        for r in self.rows:
+        total = len(self.rows)
+        for n, r in enumerate(self.rows, start=1):
+            if progress and n % every == 0:
+                progress(n, total)
             try:
                 out.append(self.process(r))
             except Exception as exc:  # never lose a line: fall back to a safe row
@@ -1167,4 +1184,6 @@ class Engine:
                         rule=f"error:{type(exc).__name__}",
                     )
                 )
+        if progress:
+            progress(total, total)
         return out
