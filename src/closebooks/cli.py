@@ -214,6 +214,22 @@ def submit(
 
 
 @app.command()
+def fetch(sub_id: str) -> None:
+    """Re-download the result of a submission we already made (does NOT use a slot)."""
+    from closebooks.submit import SubmitError
+    from closebooks.submit import fetch as do_fetch
+
+    try:
+        res = do_fetch(sub_id)
+    except SubmitError as exc:
+        console.print(f"[red]FAILED:[/] {exc}")
+        raise typer.Exit(1) from exc
+    console.print_json(
+        json.dumps({k: res.get(k) for k in ("status", "score", "metrics", "errors")})
+    )
+
+
+@app.command()
 def history() -> None:
     """List our submissions (from out/submissions/log.jsonl)."""
     from closebooks.submit import history as hist

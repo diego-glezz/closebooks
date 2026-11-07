@@ -17,7 +17,9 @@ description: Disciplina de envíos al leaderboard de Talky - límites (1 cada 3 
 2. `uv run closebooks run train` (o `sample` si vamos con prisa): el score local no baja respecto al último envío.
 3. `uv run closebooks run live`: valida el fichero (sin errores y con el 100 % de movimientos cubiertos).
 4. `uv run closebooks submit out/live/submission.csv.gz --phase LIVE --note "<qué cambió>" --dry-run`, y luego
-   sin `--dry-run`. Queda registrado en `out/submissions/` y en `docs/SUBMISSIONS.md`.
+   sin `--dry-run`. Cada envío queda en `out/submissions/<hora UTC>_<FASE>/`: el fichero exacto enviado, su
+   `explain.csv.gz`, todas las respuestas del servidor (`responses.jsonl`), `final.json` y `meta.json`; y una fila en
+   `docs/SUBMISSIONS.md`. Si se corta la red esperando la nota, `closebooks fetch <sub_id>` la recupera sin gastar hueco.
 5. **Un cambio por envío** siempre que se pueda. La puntuación LIVE trae el desglose por métrica y segmento: compáralo
    con TRAIN. Si un segmento va mucho peor en LIVE que en TRAIN → drift (skill `dataset-onboarding`).
 

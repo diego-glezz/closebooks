@@ -24,6 +24,7 @@ uv run closebooks report --start 2024-07-01 --end 2024-12-31   # dónde se pierd
 uv run closebooks diff --start 2024-07-01 --end 2024-12-31 --segment ar_partial --rule party_amount
 uv run closebooks submit out/live/submission.csv.gz --phase LIVE --note "..." --dry-run
 uv run closebooks history
+uv run closebooks fetch <sub_id>               # vuelve a pedir el resultado de un envío (no gasta hueco)
 ```
 
 ## Arquitectura (`src/closebooks/bankrec/`)
