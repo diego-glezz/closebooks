@@ -76,6 +76,16 @@ def _within(day: str, ref: str, before: int, after: int) -> bool:
     return r - timedelta(days=before) <= d <= r + timedelta(days=after)
 
 
+def _run_total_in(rows: list[dict], ccy: str, day: str, fx: FX) -> int:
+    """Total of a payment run in the currency of the debtor account: documents in another
+    currency converted at the reference rate of the execution day (credit notes are negative)."""
+    total = 0
+    for row in rows:
+        c = int(row["doc_c"])
+        total += c if row["currency"] == ccy else (fx.convert(c, row["currency"], ccy, day) or 0)
+    return total
+
+
 def _overpay_pattern(excess: int, total: int) -> bool:
     """Excess of an overpayment as customers make it: a round amount or 1 % / 10 % of the bill."""
     if excess <= 0:
@@ -178,6 +188,21 @@ class Engine:
                     if old in self.book.cancelled:
                         self.book.cancelled.add(iid)
 
+    def _cancel_by_reason(self) -> None:
+        """POLICIES §5.7: an invoice cancelled by a credit note, and that credit note, are never
+        settled by bank. The PDF ("anula y sustituye") only covers a subset; the credit note's
+        own reason ("Anulación de factura") says it too. In TRAIN the bank never settles those
+        credit notes, and almost never their invoice: left open, they pair up into zero-sum
+        combinations that make every subset search ambiguous."""
+        for iid in sorted(self.book.items):
+            it = self.book.items[iid]
+            if it.is_credit and "ANULACION" in fold(it.reason):
+                self.book.cancelled.add(iid)
+                if it.related:
+                    self.book.cancelled.update(
+                        self._carried(it.related, it.side, {it.entity}, it.issue)
+                    )
+
     def _carried(self, number: str, side: str, entities: set[str], before: str) -> list[str]:
         """Items with exactly this printed number (no noisy keys), issued on or before `before`."""
         return [
@@ -226,6 +251,12 @@ class Engine:
                 if len(tok) >= 10:
                     self.tok_idx[tok].append(i)
             self.amt_idx[(r["account_id"], int(r["amount_c"]))].append(i)
+        # instructed amount of lines in another currency: (account, |orig cents|, orig currency)
+        self.orig_idx: dict[tuple[str, int, str], list[int]] = defaultdict(list)
+        for i, r in enumerate(self.rows):
+            if int(r["orig_amount_c"] or 0):
+                key = (r["account_id"], abs(int(r["orig_amount_c"])), r["orig_currency"])
+                self.orig_idx[key].append(i)
 
     def _link_confirming(self, conf: pd.DataFrame) -> None:
         """Confirming: the bank debits, per maturity date, the transfers of the run that fall due
@@ -343,6 +374,7 @@ class Engine:
                     if t not in self.linked and int(self.rows[i]["amount_c"]) < 0:
                         conf = runs[runs["run_id"] == g0["run_id"]].to_dict("records")
                         self.linked[t] = ("confirming", conf)
+            self._link_fx_runs(runs)
         # --- direct-debit batches
         if not ph.dd.empty:
             dd = ph.dd.copy()
@@ -422,6 +454,80 @@ class Engine:
                             in fold(self.rows[i]["text"] + " " + self.rows[i]["counterparty_name"])
                         ]
                 self._claim(cands, "advice", adv, day, 15, 15)
+            self._link_fx_advices(advices)
+
+    def _link_fx_runs(self, runs: pd.DataFrame) -> None:
+        """Second pass for payment runs paid in another currency than the debtor account
+        (POLICIES §3 FX): the first pass compares the debit with amounts in document currency,
+        which never matches. A transfer is the debit whose instructed amount is the transfer
+        amount; an aggregated file is the ONE debit citing the run whose amount is the run total
+        with the foreign documents converted at the reference rate of the execution day."""
+        if runs.empty:
+            return
+        key = runs["end_to_end_id"].where(
+            runs["run_type"] == "transfers", runs["run_id"] + "|" + runs["execution_date"]
+        )
+        for (rtype, _k), g in runs.groupby([runs["run_type"], key]):
+            g0 = g.iloc[0]
+            acct, day = g0["debtor_account_id"], g0["execution_date"]
+            accy = self.acc_ccy.get(acct, "")
+            if not accy or (g["currency"] == accy).all():
+                continue  # same currency: handled by the first pass
+            payload = g.to_dict("records")
+            if rtype == "transfers":
+                xc, ccy = abs(int(g0["xfer_c"])), g0["currency"]
+                cands = [
+                    i
+                    for i in self.tok_idx.get(alnum(g0["end_to_end_id"]), [])
+                    if int(self.rows[i]["amount_c"]) < 0
+                    and abs(int(self.rows[i]["orig_amount_c"] or 0)) == xc
+                    and self.rows[i]["orig_currency"] == ccy
+                ]
+                cands = cands or self.orig_idx.get((acct, xc, ccy), [])
+                self._claim(cands, "run", payload, day, 2, 6)
+            else:
+                expected = _run_total_in(payload, accy, day, self.fx)
+                cands = [
+                    i
+                    for i in self.tok_idx.get(alnum(g0["run_id"]), [])
+                    if int(self.rows[i]["amount_c"]) < 0
+                    and abs(-int(self.rows[i]["amount_c"]) - expected) <= max(100, 0.003 * expected)
+                ]
+                if len(cands) == 1:
+                    self._claim(cands, "run", payload, day, 2, 6)
+
+    def _link_fx_advices(self, advices: list[Advice]) -> None:
+        """Second pass for advices of receipts in another currency: the advice is in invoice
+        currency, so it matches the instructed amount (orig_amount) of the bank line, not the
+        account-currency amount; the reference (e.g. "REM/2025/2529") is split by "/" in the
+        token index, so the payer's name or the whole reference in the text corroborates it."""
+        linked = {v[1].file for v in self.linked.values() if v[0] == "advice"}
+        by_orig: dict[int, list[int]] = defaultdict(list)
+        for i, r in enumerate(self.rows):
+            if (
+                int(r["amount_c"]) > 0
+                and int(r["orig_amount_c"] or 0)
+                and r["orig_currency"] != r["currency"]
+            ):
+                by_orig[abs(int(r["orig_amount_c"]))].append(i)
+        for adv in advices:
+            if not adv.lines or adv.file in linked:
+                continue
+            ref = alnum(adv.ref)
+            payer = fold(adv.payer).split()
+            first = alnum(payer[0]) if payer else ""
+            cands: list[int] = []
+            for amt in sorted({adv.paid_total, adv.total_c or 0} - {0}):
+                for i in by_orig.get(abs(amt), []):
+                    r = self.rows[i]
+                    blob = alnum(
+                        " ".join(
+                            str(r[c]) for c in ("text", "remittance_info", "counterparty_name")
+                        )
+                    )
+                    if (len(ref) >= 6 and ref in blob) or (first and first in blob):
+                        cands.append(i)
+            self._claim(cands, "advice", adv, adv.pay_date or adv.received, 15, 15)
 
     # ================================================================ per line
 
@@ -649,6 +755,22 @@ class Engine:
     # ---------------------------------------------------------------- strategies
 
     def _from_link(self, r: dict, ctx: Ctx, kind: str, payload) -> Result | None:
+        """Allocations from a linked detail file. In a payment run, a document in another
+        currency than the debtor account is cleared with FX_DIFFERENCE (POLICIES §3; credit
+        notes stay empty, PARTIAL / SHORT_DISPUTE keep their code)."""
+        res = self._from_link_rows(r, ctx, kind, payload)
+        if res and kind == "run":
+            res.allocs = [
+                Alloc(a.item, a.amount_c, "FX_DIFFERENCE")
+                if a.exception == ""
+                and not self.book.items[a.item].is_credit
+                and self.book.items[a.item].ccy != r["currency"]
+                else a
+                for a in res.allocs
+            ]
+        return res
+
+    def _from_link_rows(self, r: dict, ctx: Ctx, kind: str, payload) -> Result | None:
         txn = r["bank_txn_id"]
         ent = r["entity"]
         allocs: list[Alloc] = []

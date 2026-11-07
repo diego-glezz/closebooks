@@ -563,3 +563,45 @@ def test_weak_citations_are_accepted_only_when_they_agree_on_one_party():
     assert engine._corroborated(fake, [one, other], set(), ctx(31000)) == [other]
     # strong citations are not part of the vote
     assert engine._corroborated(fake, [one, two], {one, two}, ctx(65000)) == []
+
+
+def test_cancelling_credit_note_and_its_invoice_are_never_settled():
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    def row(iid, number, related="", reason=""):
+        return {
+            "item_id": iid, "kind": iid[:3], "side": "AR", "entity": "ES01", "number": number,
+            "issue_date": "2025-05-01", "due_date": "2025-05-01", "party_id": "C1",
+            "party_name": "C", "currency": "EUR", "total_c": 1000, "open_c": 1000, "terms": "",
+            "po": "", "method": "", "related": related, "reason": reason,
+        }  # fmt: skip
+
+    book = Book(
+        pd.DataFrame(
+            [
+                row("ARI-2025-0000001", "FV1"),
+                row("ARC-2025-0000001", "NC1", "FV1", "Anulación de factura"),
+                row("ARI-2025-0000002", "FV2"),
+                row("ARC-2025-0000002", "NC2", "FV2", "Devolución / rectificación"),
+            ]
+        )
+    )
+    fake = SimpleNamespace(book=book)
+    fake._carried = Engine._carried.__get__(fake)
+    Engine._cancel_by_reason(fake)
+    assert book.cancelled == {"ARI-2025-0000001", "ARC-2025-0000001"}  # a return stays open
+
+
+def test_aggregated_run_total_converts_foreign_documents_to_the_account_currency():
+    # an EUR account pays a bulk file with USD documents: the debit is the EUR total with the
+    # USD documents converted at the reference rate (1.10 USD per EUR here)
+    from closebooks.bankrec.engine import _run_total_in
+
+    rows = [
+        {"doc_c": 50000, "currency": "EUR"},
+        {"doc_c": 110000, "currency": "USD"},
+        {"doc_c": -11000, "currency": "USD"},  # credit note netted
+    ]
+    assert _run_total_in(rows, "EUR", "2025-03-03", FX_RATES) == 50000 + 100000 - 10000

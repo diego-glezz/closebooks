@@ -169,10 +169,16 @@ def _items_from_tables(folder: Path) -> pd.DataFrame:
                     "po": "",
                     "method": "",
                     "related": cn["related_document"],
+                    "reason": cn.get("reason", ""),
                 }
             )
         )
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    # credit-note reason ("Anulación de factura"...): empty for invoices
+    out["reason"] = out["reason"].fillna("") if "reason" in out else ""
+    return out
 
 
 def load_items(root: Path, phase: str) -> pd.DataFrame:
@@ -212,12 +218,13 @@ def load_items(root: Path, phase: str) -> pd.DataFrame:
                 "po": "",
                 "method": "",
                 "related": "",
+                "reason": "",
                 "open_c": cents(st["open_amount"]),
             }
         )
         if len(prev):
             attrs = prev.drop_duplicates("item_id").set_index("item_id")
-            for col in ("party_name", "terms", "po", "method", "related"):
+            for col in ("party_name", "terms", "po", "method", "related", "reason"):
                 carried[col] = carried["item_id"].map(attrs[col]).fillna("")
         items = pd.concat(
             [carried, items[~items["item_id"].isin(carried["item_id"])]], ignore_index=True
