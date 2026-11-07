@@ -1,7 +1,7 @@
 """Experiment switches for role B (references and third parties).
 
-Every field defaults to the behaviour of `main`, so an empty `CB_FLAGS` reproduces the baseline
-byte for byte. A candidate is described by a JSON object in the `CB_FLAGS` environment variable,
+Every field defaults to the behaviour of `main` (except `ref_cn_subset`, switched on after DEV and
+HOLDOUT), so an empty `CB_FLAGS` reproduces the current engine byte for byte. A candidate is described by a JSON object in the `CB_FLAGS` environment variable,
 which lets a genetic search launch independent processes with different genomes.
 """
 
@@ -28,6 +28,11 @@ class Flags:
     fam_parties: int = 3  # payers whose family filters a cited reference
     name_min_len: int = 8  # chars of a truncated name needed to accept it
     stale_days: int = 0  # 0 = off; ignore open items older than this when completing FIFO
+    # cited invoices paid net of a SUBSET of the party's credit notes; ON since 7 nov
+    # (DEV 85.99 -> 86.06, HOLDOUT 85.68 -> 85.75, pair precision 0.92 / 0.97)
+    ref_cn_subset: bool = True
+    pdf_exact: bool = False  # PDF clauses only apply to the item with the exact printed number
+    pdf_dated: bool = False  # PDF clauses never touch items issued after the PDF's own date
 
 
 def load() -> Flags:

@@ -262,3 +262,58 @@ def test_name_matching_uses_same_normalization_on_both_sides():
     sup = pd.DataFrame(columns=["supplier_id", "entity", "name", "country", "iban"])
     p = Parties(cust, sup, {})
     assert p.by_name("ACH CREDIT POOL & SPA KING E HIJOS CCD", {"US01"})[0][0] == "C1"
+
+
+# ---------------------------------------------------------------- role-B switches
+
+
+def _fake_engine(book: Book):
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    fake = SimpleNamespace(book=book, fx=FX_RATES, terms=TERMS)
+    fake._signed = lambda i: Engine._signed(fake, i)
+    return Engine, fake
+
+
+def test_cited_invoices_paid_net_of_a_subset_of_credit_notes():
+    """ref_cn_subset: the shortfall is exactly ONE subset of the party's open credit notes."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 100000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-2", 50000, "2025-04-03"),
+        ("ARC-2025-0000003", "AB25-1", 7000, "2025-04-05"),
+        ("ARC-2025-0000004", "AB25-2", 2500, "2025-04-06"),
+        ("ARC-2025-0000005", "AB25-3", 900, "2025-04-07"),
+    )
+    engine, fake = _fake_engine(b)
+    cns = ["ARC-2025-0000003", "ARC-2025-0000004", "ARC-2025-0000005"]
+    inv = ["ARI-2025-0000001", "ARI-2025-0000002"]
+    got = engine._net_of_credits(fake, inv, cns, ctx(150000 - 7000 - 900))
+    assert {(a.item, a.amount_c, a.exception) for a in got} == {
+        ("ARI-2025-0000001", 100000, ""),
+        ("ARI-2025-0000002", 50000, ""),
+        ("ARC-2025-0000003", 7000, ""),
+        ("ARC-2025-0000005", 900, ""),
+    }
+    # no subset of the credit notes explains the shortfall: leave it to ref_partial
+    assert engine._net_of_credits(fake, inv, cns, ctx(150000 - 1234)) is None
+    # cash above the cited invoices: not this rule
+    assert engine._net_of_credits(fake, inv, cns, ctx(150100)) is None
+
+
+def test_pdf_clauses_never_touch_invoices_issued_after_the_pdf(monkeypatch):
+    """pdf_dated: a 2024 PDF must not reach this year's invoice through the noisy keys."""
+    from closebooks.bankrec import engine as eng
+
+    b = make_book(("ARI-2025-0000001", "RE250104461", 1000, "2025-06-26"))
+    _, fake = _fake_engine(b)
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", False)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == [
+        "ARI-2025-0000001"
+    ]
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", True)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == []
+    assert eng.Engine._pdf_items(fake, "RE250104461", "AR", "ES01", "2025-07-02") == [
+        "ARI-2025-0000001"
+    ]
