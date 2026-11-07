@@ -9,3 +9,4 @@
 | 14:11 | LIVE | 4917cd2 | rama B: ref_set_cn, facturas citadas netas de un subconjunto de abonos (4b57e65) | 82.28 | 0.8453 | 0.9051 | 0.6432 | scored |
 | 14:42 | LIVE | fb4ade9 |  | 84.41 | 0.8481 | 0.9193 | 0.7212 | scored |
 | 14:51 | LIVE | 4e1bc28 |  | 82.49 | 0.8468 | 0.9072 | 0.6468 | scored |
+| 15:06 | LIVE | a60f948 | main con ramas A+B+C+D mergeadas | 87.75 | 0.8758 | 0.9297 | 0.8037 | scored |
