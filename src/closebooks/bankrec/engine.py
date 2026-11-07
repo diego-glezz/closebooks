@@ -370,7 +370,7 @@ class Engine:
             maturity = next_business(max(dues))
             groups[(recs[0]["run_id"], maturity)] += recs
             transfers[recs[0]["run_id"]][str(e2e)] = (maturity, int(recs[0]["xfer_c"]), recs)
-        claimed: set[str] = set()
+        claimed: set[tuple[str, str]] = set()  # (run_id, end_to_end_id)
         for (run_id, maturity), rows in sorted(groups.items()):
             amount = -sum({r["end_to_end_id"]: int(r["xfer_c"]) for r in rows}.values())
             cands = [
@@ -379,7 +379,7 @@ class Engine:
                 if int(self.rows[i]["amount_c"]) == amount
             ]
             if self._claim(cands, "run", rows, maturity, 4, 4):
-                claimed |= {str(r["end_to_end_id"]) for r in rows}
+                claimed |= {(run_id, str(r["end_to_end_id"])) for r in rows}
         self._repair_confirming(transfers, claimed)
         # fallback: a debit citing the run ("REMESA CF... 8 PROVEEDORES") that no maturity group
         # explained (due dates not found, another maturity): the ONLY set of the run's
@@ -406,7 +406,9 @@ class Engine:
                     self.linked[r["bank_txn_id"]] = ("run", payload)
 
     def _repair_confirming(
-        self, transfers: dict[str, dict[str, tuple[str, int, list[dict]]]], claimed: set[str]
+        self,
+        transfers: dict[str, dict[str, tuple[str, int, list[dict]]]],
+        claimed: set[tuple[str, str]],
     ) -> None:
         """Confirming debits still unlinked: the bank also pays, on the first possible day, the
         transfers that were already overdue, so a debit = transfers of its run due up to its
@@ -424,18 +426,36 @@ class Engine:
                 r = self.rows[i]
                 if r["bank_txn_id"] in self.linked:
                     continue
-                m = _N_SUPPLIERS.search(fold(r["text"]))
+                # the count may sit in any field (camt.053 moves texts around)
+                blob = " ".join(
+                    str(r[c] or "") for c in ("text", "ref1", "ref2", "remittance_info")
+                )
+                m = _N_SUPPLIERS.search(fold(blob))
                 if not m:
                     continue
                 n_sup, cash, day = int(m.group(1)), -int(r["amount_c"]), r["booking_date"]
-                free = [e for e in sorted(tr) if e not in claimed]
+                free = [e for e in sorted(tr) if (run_id, e) not in claimed]
                 due = [e for e in free if tr[e][0] <= day]
                 soon = [e for e in free if day < tr[e][0] <= _shift(day, 4)]
                 pick = _fix_set(due, soon, {e: tr[e][1] for e in free}, cash, n_sup)
                 if pick is None:
                     continue
                 self.linked[r["bank_txn_id"]] = ("run", [x for e in pick for x in tr[e][2]])
-                claimed |= set(pick)
+                claimed |= {(run_id, e) for e in pick}
+
+    def _advice_rank(self, i: int, adv: Advice, day: str) -> tuple:
+        """Order of the receipts citing an advice reference: amount = advice total (same
+        currency) first, then the closest booking date."""
+        r = self.rows[i]
+        cash = int(r["amount_c"])
+        same_ccy = not adv.currency or adv.currency == r["currency"]
+        targets = [t for t in (adv.paid_total, adv.total_c or 0) if t]
+        fits = same_ccy and any(abs(cash - t) <= max(100, t * 0.05) for t in targets)
+        try:
+            gap = abs((_d(r["booking_date"]) - _d(day)).days)
+        except ValueError:
+            gap = 999
+        return (not fits, gap, i)
 
     FX_TOLERANCE = 0.03  # POLICIES §3: the bank spread is always well within 3 %
 
@@ -598,11 +618,19 @@ class Engine:
                     continue
                 day = adv.pay_date or adv.received
                 tok = alnum(adv.ref)
+                # advice references ("REM/2025/1173") repeat across customers and entities: keep
+                # receipts of the advice's entity, the one whose amount is the advice total first
                 cands = (
-                    [i for i in self.tok_idx.get(tok, []) if int(self.rows[i]["amount_c"]) > 0]
+                    [
+                        i
+                        for i in self.tok_idx.get(tok, [])
+                        if int(self.rows[i]["amount_c"]) > 0
+                        and (not adv.entity or self.rows[i]["entity"] == adv.entity)
+                    ]
                     if len(tok) >= 6
                     else []
                 )
+                cands.sort(key=lambda i, adv=adv, day=day: self._advice_rank(i, adv, day))
                 if not cands:
                     payer = fold(adv.payer).split()
                     first = payer[0] if payer else "#"
@@ -999,16 +1027,21 @@ class Engine:
         if kind == "run":
             ents = AP_FACTORY.get(ent, {ent})
             cands: list[tuple[dict, int, list[str]]] = []
+            by_benef: dict[str, list[str]] = {}
             for row in payload:
                 amt = abs(round(float(row["document_amount"]) * 100))
-                sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
-                iban_known = bool(sup)
-                if not sup and row.get("beneficiary"):
-                    # aggregated files often leave the IBAN empty: the beneficiary NAME still
-                    # says which supplier it is (supplier numbers repeat across suppliers)
-                    sup = self._suppliers_named(row["beneficiary"], ents)
+                iban = alnum(row["beneficiary_iban"])
+                sup = sorted(self.parties.by_iban.get(iban, set())) if iban else []
+                benef = str(row.get("beneficiary") or "")
+                if not sup and benef:
+                    # some runs carry no beneficiary IBAN (US01 bulk payments): the supplier
+                    # is the beneficiary name; ties keep every equally good name
+                    if benef not in by_benef:
+                        ps = self.parties.by_name(benef, ents)
+                        by_benef[benef] = sorted(p for p, s in ps if s == ps[0][1]) if ps else []
+                    sup = by_benef[benef]
                 ids: list[str] = []
-                for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
+                for p in sup:  # every supplier with that IBAN / name (they can repeat)
                     ids += [
                         i
                         for i in self.book.find_number(
@@ -1016,8 +1049,23 @@ class Engine:
                         )
                         if i not in self.book.cancelled and i not in ids
                     ]
-                if not ids and not iban_known:  # unknown beneficiary IBAN: any supplier's doc
-                    ids = self.book.find_number(row["document_number"], side="AP", entities=ents)
+                if not ids and not sup:
+                    # unknown beneficiary: supplier numbers repeat across suppliers, so take a
+                    # document only if its amount agrees and it is of a single supplier
+                    tol = max(1, amt // 200)
+                    ids = [
+                        i
+                        for i in self.book.find_number(
+                            row["document_number"], side="AP", entities=ents
+                        )
+                        if i not in self.book.cancelled
+                        and (
+                            abs(self.book.items[i].total - amt) <= tol
+                            or abs(self.book.open[i] - amt) <= tol
+                        )
+                    ]
+                    if len({self.book.items[i].party for i in ids}) > 1:
+                        ids = []
                 if ids:
                     cands.append((row, amt, ids))
 
@@ -1052,9 +1100,12 @@ class Engine:
                 # closed means an earlier allocation was wrong, not a duplicate (measured on
                 # HOLDOUT: 0 of 188 DUPLICATE_PAYMENT rows from runs were right)
                 it = self.book.items[iid]
-                if not it.is_credit and amt < open_c - 1:
+                # (no DUPLICATE_PAYMENT here: the run file lists what we are paying; in TRAIN a
+                # run row flagged as a duplicate was never one -- 0 of ~150 per half-year)
+                cleared = abs(amt - open_c) <= max(1, open_c // 200) or abs(amt - total) <= 1
+                if not it.is_credit and open_c and amt < open_c - 1:
                     exc = "PARTIAL"  # the run pays part of the document; the rest stays open
-                elif not it.is_credit and it.ccy != r["currency"]:
+                elif not it.is_credit and it.ccy != r["currency"] and cleared:
                     exc = "FX_DIFFERENCE"  # POLICIES §3: invoice in another currency, cleared
                 else:
                     exc = ""
