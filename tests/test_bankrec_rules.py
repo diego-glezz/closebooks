@@ -7,7 +7,14 @@ import pytest
 
 from closebooks.bankrec.book import Book
 from closebooks.bankrec.docs import Advice, _parse_csv_rows, _parse_txt, parse_amount, parse_clauses
-from closebooks.bankrec.rules import FX, RETURN_RX, Ctx, category_by_text, settle
+from closebooks.bankrec.rules import (
+    FX,
+    RETURN_RX,
+    Ctx,
+    category_by_text,
+    duplicate_refund_category,
+    settle,
+)
 from closebooks.bankrec.text import number_keys, service_month, text_tokens
 
 TERMS = {"D2N30": (2.0, 10), "T30": (0.0, 0)}
@@ -87,6 +94,12 @@ def test_categories():
     assert category_by_text("PAG NOMINAS | NOMINAS 01/2022") == "PAYROLL"
     assert category_by_text("IMPUESTOS MOD 111 202110") == "TAX_PAYMENT"
     assert category_by_text("COMISION TRANSF. EXTERIOR") == "BANK_FEES"
+
+
+def test_duplicate_payment_refund_category_depends_on_sign():
+    assert duplicate_refund_category("REFUND DUPLICATE PAYMENT", receipt=False) == "CUSTOMER_REFUND"
+    assert duplicate_refund_category("ABONO PAGO DOBLE", receipt=True) == "SUPPLIER_REFUND"
+    assert duplicate_refund_category("TRANSF FERRETERIA GOMEZ FRA 1003", receipt=True) is None
 
 
 # ---------------------------------------------------------------- documents
@@ -191,6 +204,33 @@ def test_international_bank_charges():
     b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01"))
     a = settle(b, ["ARI-2025-0000001"], ctx(189444, international=True), FX_RATES, TERMS)
     assert (a[0].amount_c, a[0].exception) == (191944, "SHORT_BANK_CHARGES")
+
+
+def test_bank_charges_never_span_several_invoices():
+    b = make_book(
+        ("ARI-2025-0000001", "FV21-1", 100000, "2025-05-01"),
+        ("ARI-2025-0000002", "FV21-2", 100000, "2025-05-02"),
+    )
+    a = settle(
+        b,
+        ["ARI-2025-0000001", "ARI-2025-0000002"],
+        ctx(198000, international=True),
+        FX_RATES,
+        TERMS,
+    )
+    assert "SHORT_BANK_CHARGES" not in {x.exception for x in a}
+
+
+def test_bank_charges_must_follow_learned_fee_schedule():
+    b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01"))
+    ids = ["ARI-2025-0000001"]
+    on = ctx(189444, international=True, fees={"EUR": [1500, 2500]})
+    off = ctx(189444 + 500, international=True, fees={"EUR": [1500, 2500]})
+    assert settle(b, ids, on, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+    assert settle(b, ids, off, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    # a currency without learned schedule keeps the generic rule
+    other = ctx(189444, international=True, fees={"USD": [1185]})
+    assert settle(b, ids, other, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
 
 
 def test_partial_payment_keeps_cash_amount():

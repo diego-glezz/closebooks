@@ -108,6 +108,8 @@ class Ctx:
     orig_ccy: str
     international: bool  # cross-border from outside SEPA (charges possible)
     payer_country: str
+    # learned from TRAIN before the window: currency -> shortfalls (cents) of intermediary fees
+    fees: dict[str, list[int]] | None = None
 
 
 def _days(d: str) -> date:
@@ -199,11 +201,15 @@ def settle(
             wh = sum(round(it.total * rate / 100) for it, _ in invoices)
             if abs(diff - wh) <= tol + len(invoices):
                 return full("SHORT_WITHHOLDING")
-    # intermediary bank charges: <= 60 EUR equivalent and <= 2 % of the item
-    if ctx.international and len(invoices) >= 1 and not late_discount:
+    # intermediary bank charges: <= 60 EUR equivalent and <= 2 % of the item. Always ONE invoice
+    # (0 of 1130 SBC in TRAIN span several), and when the currency has a learned fee schedule
+    # the shortfall has to be one of its fees.
+    if ctx.international and len(invoices) == 1 and not late_discount:
         eur = fx.convert(diff, iccy, "EUR", ctx.booking) or diff
-        biggest = max(o for _, o in invoices)
-        if eur <= 6000 and diff <= 0.02 * biggest:
+        biggest = invoices[0][1]
+        known = (ctx.fees or {}).get(iccy)
+        on_schedule = not known or any(abs(diff - f) <= 2 for f in known)
+        if eur <= 6000 and diff <= 0.02 * biggest and on_schedule:
             return full("SHORT_BANK_CHARGES")
     if not allow_partial:
         return None
@@ -294,6 +300,17 @@ def category_by_text(text: str) -> str | None:
     for rx, cat in _COMPILED:
         if rx.search(t):
             return cat
+    return None
+
+
+# Refund of a payment made twice (POLICIES §4): our outgoing refund to a customer is
+# CUSTOMER_REFUND, the incoming refund from a supplier is SUPPLIER_REFUND.
+DUP_REFUND_RX = re.compile(r"PAGO DOBLE|DUPLICA|DOPPEL|DOUBLE|DOPPIO|DUBBEL")
+
+
+def duplicate_refund_category(text: str, receipt: bool) -> str | None:
+    if DUP_REFUND_RX.search(fold(text)):
+        return "SUPPLIER_REFUND" if receipt else "CUSTOMER_REFUND"
     return None
 
 

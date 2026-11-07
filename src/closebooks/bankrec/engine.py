@@ -36,6 +36,7 @@ from closebooks.bankrec.rules import (
     category_by_text,
     deduction_kind,
     discount_c,
+    duplicate_refund_category,
     settle,
     unique_subset,
 )
@@ -376,6 +377,7 @@ class Engine:
             orig_ccy=orig_ccy,
             international=international,
             payer_country="",
+            fees=self.cats.fees,
         )
 
     def _scope(self, r: dict, receipt: bool) -> set[str]:
@@ -446,6 +448,9 @@ class Engine:
             )
             if cat in ("CASH_POOL", "INTERNAL_TRANSFER", "INTERCOMPANY", "FX_DEAL"):
                 return Result(txn, category=cat, rule="own_account")
+        dup_refund = duplicate_refund_category(text, receipt)
+        if dup_refund:
+            return Result(txn, category=dup_refund, rule="duplicate_refund")
         learned = self.cats.strong(r)
         if learned:
             exc = "UNIDENTIFIED" if learned == "UNIDENTIFIED" else ""
