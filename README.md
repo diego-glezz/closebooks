@@ -49,7 +49,7 @@ uv run closebooks submit out/live/submission.csv.gz --phase LIVE --note "..." --
 `CLAUDE.md` (reglas del proyecto) · skills en `.claude/skills/` (`bankrec-policies`, `new-matching-rule`,
 `dataset-onboarding`, `leaderboard-loop`) · subagentes en `.claude/agents/` (`failure-analyst`, `code-reviewer`,
 `test-writer`, `data-scout`, `reconciliation-auditor`) · comandos `/run-eval`, `/pre-submit`, `/explore-data`,
-`/cleanup`, `/handoff` · hook de ruff en `.claude/settings.json`. Organización del día: `docs/PLAYBOOK.md`.
+`/cleanup`, `/handoff` · hook de ruff en `.claude/settings.json`. Organización del día: `docs/PLAYBOOK.md`. El reto explicado en sencillo: `docs/RETO.md`.
 
 ## Estructura del repo
 
