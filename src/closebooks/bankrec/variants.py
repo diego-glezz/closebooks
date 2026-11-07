@@ -38,7 +38,12 @@ class Flags:
     # complete a truncated citation with items close in issue date. ON since 2026-11-07:
     # DEV 86.24 -> 86.53, HOLDOUT 85.91 -> 86.20 (ref_completed precision 0.991)
     complete_near: bool = True
-    complete_k: int = 3  # max uncited items added by the completion subset search
+    # max uncited items added by the completion subset search. 5 since 2026-11-07 (with
+    # complete_near): DEV 89.24 -> 89.42, HOLDOUT 89.09 -> 89.27, ref_completed precision 0.961.
+    # k=4 is the conservative choice (+0.12 / +0.11, precision 0.98); k=6 not worth it
+    # (marginal precision already 0.82 from k=4 to k=5)
+    complete_k: int = 5
+    complete_pool: int = 25  # open items (closest in issue date) the completion searches
     trust_no_partial: bool = False  # ref_trust_other only for exact / completed sets (no PARTIAL)
     unid_known_payer: bool = False  # payer known with open invoices: no UNIDENTIFIED exception
     # "UNIDENTIFIED selectivo": like unid_known_payer, but cash-like receipts (small or round
@@ -50,6 +55,9 @@ class Flags:
     # 14-upgrade: the "small" threshold in EUR equivalent (ECB rate). ON: DEV 89.22 -> 89.23,
     # HOLDOUT 89.07 -> 89.08; also keeps the rule sane for the new ZAR subsidiary in FINAL
     unid_small_eur: bool = True
+    # 14 fix: a receipt larger than everything the payer has open cannot pay its invoices, so it
+    # stays UNIDENTIFIED even with a known payer (POLICIES §3: no open item explains it)
+    unid_cap: bool = False
     # 'FV23-03201 03266' -> FV23-03266 (implicit prefix), POLICIES §5.5. ON: DEV +0.01,
     # HOLDOUT +0.01; its pairs have precision 0.996-1.000
     ref_expand: bool = True

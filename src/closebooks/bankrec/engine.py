@@ -646,6 +646,8 @@ class Engine:
                 # 1,000 MXN is ~50 EUR: compare cash-like size in one currency
                 size = self.fx.convert(ctx.cash_c, ctx.ccy, "EUR", ctx.booking) or ctx.cash_c
             known = not (size < FLAGS.unid_small * 100 or ctx.cash_c % 100 == 0)
+            if known and FLAGS.unid_cap:
+                known = ctx.cash_c <= self._payer_open_total(parties, ctx) + 100
         guess = self.cats.fallback(r)
         if guess:
             exc = "UNIDENTIFIED" if guess == "UNIDENTIFIED" else ""
@@ -1179,6 +1181,18 @@ class Engine:
             for i in self.book.open_items(q, ctx.booking, "AR")
         )
 
+    def _payer_open_total(self, parties: list[str], ctx: Ctx) -> int:
+        """Cents the most likely payer (and family) owes in open AR invoices, account currency
+        only (other currencies are skipped: no conversion is needed to bound a same-ccy payment)."""
+        if not parties:
+            return 0
+        return sum(
+            self.book.open[i]
+            for q in sorted(self.parties.family(parties[0]))
+            for i in self.book.open_items(q, ctx.booking, "AR")
+            if not self.book.items[i].is_credit and self.book.items[i].ccy == ctx.ccy
+        )
+
     def _why(self, txn: str, reason: str) -> None:
         """trace_ref: remember why the reference strategy gave up on this line."""
         if FLAGS.trace_ref:
@@ -1591,7 +1605,7 @@ class Engine:
                 small = sorted(
                     pool,
                     key=lambda i: (abs((_d(self.book.items[i].issue) - anchor).days), i),
-                )[:25]
+                )[: FLAGS.complete_pool]
             for k in range(1, FLAGS.complete_k + 1):
                 for sub in itertools.combinations(small, k):
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:
