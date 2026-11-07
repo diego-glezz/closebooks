@@ -16,3 +16,5 @@
 | 16:21 | LIVE | 3969ead | anticipos: reabrir saldo neteado + Net amount due | 87.77 | 0.8758 | 0.9301 | 0.8041 | scored |
 | 16:24 | LIVE | 85e51dc | rol D: runs multidivisa, referencias REM/... y confirming con transferencias vencidas | 89.9 | 0.9113 | 0.9321 | 0.8185 | scored |
 | 16:46 | LIVE | 69f5c3f |  | 91.51 | 0.9218 | 0.9372 | 0.8651 | scored |
+| 16:40 | LIVE | f44c893 |  | 90.53 | 0.9167 | 0.9361 | 0.8304 | scored |
+| 16:54 | LIVE | a672fa8 |  | 91.28 | 0.9226 | 0.9424 | 0.844 | scored |

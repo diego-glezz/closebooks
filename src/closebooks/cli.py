@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+from collections import Counter
 from pathlib import Path
 
 import typer
@@ -72,6 +73,9 @@ def run(
         f"{len(results)} lines -> {out}"
     )
     console.print(dict(rule_counts(results).most_common()))
+    errs = Counter(r.rule for r in results if r.rule.startswith("error:"))
+    if errs:  # every line still gets a safe row, but a systematic failure must not go unseen
+        console.print(f"[bold red]ATENCIÓN: {sum(errs.values())} líneas con error[/] {dict(errs)}")
     if scored:
         _print_score(res)
     else:

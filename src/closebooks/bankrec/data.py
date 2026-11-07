@@ -78,21 +78,42 @@ class Phase:
         return self.root / (self.source or self.name)
 
 
+def _categories(folder: Path) -> list[str]:
+    with open(folder / "categories.csv", encoding="utf-8") as fh:
+        return [r["category"] for r in csv.DictReader(fh)]
+
+
 def load_masters(root: Path, phase: str) -> Masters:
+    """Masters of a phase. FINAL brings final/masters_final/ (state at 2026-06-30): it is
+    UNITED with masters/ (state at 2025-12-31), the final version winning on the same key, so
+    that customers who left, old IBANs of customers who changed bank and IT01's old collections
+    account (both valid after 2026-02-01, POLICIES §5.11) are still known."""
     m = root / "masters"
     final_m = root / "final" / "masters_final"
-    if phase == "final" and final_m.exists():
-        m = final_m
-    with open(m / "categories.csv", encoding="utf-8") as fh:
-        cats = [r["category"] for r in csv.DictReader(fh)]
-    fx = _read_csv(m / "fx_rates.csv")
+    folders = [m, final_m] if phase == "final" and final_m.exists() else [m]
+
+    def table(name: str, key: list[str]) -> pd.DataFrame:
+        parts = [_read_csv(f / name) for f in folders if (f / name).exists()]
+        out = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        if len(parts) > 1:
+            out = out.drop_duplicates(key, keep="last").reset_index(drop=True)
+            out = out.fillna("")
+        return out
+
+    cats: list[str] = []
+    for f in folders:
+        if (f / "categories.csv").exists():
+            cats += [c for c in _categories(f) if c not in cats]
+    fx = table("fx_rates.csv", ["date", "currency"])
+    if len(folders) > 1:  # united tables: keep every currency in date order
+        fx = fx.sort_values(["currency", "date"], kind="stable").reset_index(drop=True)
     fx["rate"] = pd.to_numeric(fx["units_per_eur"])
     return Masters(
-        customers=_read_csv(m / "customers.csv"),
-        suppliers=_read_csv(m / "suppliers.csv"),
-        accounts=_read_csv(m / "bank_accounts.csv"),
-        entities=_read_csv(m / "entities.csv"),
-        terms=_read_csv(m / "payment_terms.csv"),
+        customers=table("customers.csv", ["customer_id"]),
+        suppliers=table("suppliers.csv", ["supplier_id"]),
+        accounts=table("bank_accounts.csv", ["account_id"]),
+        entities=table("entities.csv", ["entity"]),
+        terms=table("payment_terms.csv", ["code"]),
         fx=fx,
         categories=cats,
     )
