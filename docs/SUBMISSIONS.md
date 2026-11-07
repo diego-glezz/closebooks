@@ -6,3 +6,4 @@
 | 12:28 | LIVE | b71f626 | LIVE/FINAL leen contexto de fases anteriores (PDFs, runs, avisos) | 81.95 | 0.8413 | 0.8999 | 0.6442 | scored |
 | 13:57 | LIVE | 916a357 | contexto previo (PDFs, runs, lotes, avisos) + PDFs previos solo con número exacto | 82.6 | 0.8462 | 0.9099 | 0.6498 | scored |
 | 13:59 | LIVE | 1519786 | 1519786: SBC una factura + reembolso duplicado | 83.09 | 0.8449 | 0.9063 | 0.6829 | scored |
+| 14:42 | LIVE | fb4ade9 |  | 84.41 | 0.8481 | 0.9193 | 0.7212 | scored |
