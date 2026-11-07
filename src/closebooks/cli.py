@@ -163,7 +163,7 @@ def _category_model(data: Path, phase: str, start: str) -> Path | None:
     )
     if not before or not (data / "train" / "golden_allocations.csv.gz").exists():
         return None
-    path = Path("out/models") / f"categories_{before}.json"
+    path = Path("out/models") / f"categories_v2_{before}.json"
     if not path.exists():
         build(data, before, path)
     return path

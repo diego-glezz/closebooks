@@ -37,12 +37,15 @@ from closebooks.bankrec.rules import (
     category_by_text,
     deduction_kind,
     discount_c,
+    duplicate_refund_category,
     settle,
     unique_subset,
 )
 from closebooks.bankrec.text import alnum, fold, service_month, text_tokens
 
 AP_FACTORY = {"ES00": {"ES00", "ES01", "ES02", "PT01"}}
+# unplanned payments on account are always one of these shares of the invoice total (TRAIN)
+PARTIAL_SHARES = (0.25, 0.3, 0.4, 0.5, 0.6, 0.7)
 _MANDATE = re.compile(r"VTM-?[A-Z]{2}-?\d{4,}")
 _CHEQUE = re.compile(r"(?:CHK|CHQ|CHEQUE|CHECK)\.?\s*(?:N[O0]\.?\s*)?(\d{5,})")
 _CARD = re.compile(r"\*{2,}(\d{4})")
@@ -106,6 +109,7 @@ class Engine:
         self.cache_dir = cache_dir or Path("out/cache")
         self.cats = CategoryModel(category_model)
         self.linked: dict[str, tuple[str, object]] = {}
+        self.by_txn: dict[str, list[tuple[str, int]]] = {}  # bank line -> [(item, cents)]
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
@@ -402,6 +406,7 @@ class Engine:
             or r["bank_code"] in ("13",)
             or "SWIFT" in text
             or "INTL" in text
+            or "/CHGS/" in text  # intermediary bank charges quoted by the bank
         )
         return Ctx(
             txn=r["bank_txn_id"],
@@ -412,6 +417,7 @@ class Engine:
             orig_ccy=orig_ccy,
             international=international,
             payer_country="",
+            fees=self.cats.fees,
         )
 
     def _scope(self, r: dict, receipt: bool) -> set[str]:
@@ -455,7 +461,36 @@ class Engine:
     def _finish(self, res: Result) -> Result:
         for a in res.allocs:
             self.book.apply(res.txn, a.item, a.amount_c, a.exception)
+        if res.allocs and not any(a.exception == "RETURNED" for a in res.allocs):
+            self.by_txn[res.txn] = [(a.item, a.amount_c) for a in res.allocs]
         return res
+
+    def _reversal(self, r: dict, ctx: Ctx) -> Result | None:
+        """A credit that brings back one of OUR transfers (rejected by the beneficiary bank):
+        POLICIES §3 RETURNED, every item of the returned operation gets a row with the amount of
+        its original allocation. The original is the earlier debit for exactly this amount that
+        shares a reference token (payment-run id / end-to-end id) with the return."""
+        txn = r["bank_txn_id"]
+        blob = " ".join(
+            str(r[c]) for c in ("text", "ref1", "ref2", "end_to_end_id", "remittance_info")
+        )
+        toks = {alnum(w) for w in fold(blob).replace("|", " ").replace("/", " ").split()}
+        toks |= {alnum(p.split()[0]) for p in fold(blob).split("/REF") if p.split()}
+        found: dict[str, list[tuple[str, int]]] = {}
+        for tok in sorted(t for t in toks if len(t) >= 6 and any(ch.isdigit() for ch in t)):
+            for i in self.tok_idx.get(tok, ()):
+                o = self.rows[i]
+                if (
+                    o["bank_txn_id"] < txn
+                    and o["account_id"] == r["account_id"]
+                    and int(o["amount_c"]) == -ctx.cash_c
+                    and self.by_txn.get(o["bank_txn_id"])
+                ):
+                    found[o["bank_txn_id"]] = self.by_txn[o["bank_txn_id"]]
+        if len(found) != 1:  # none, or ambiguous: do not guess
+            return None
+        allocs = next(iter(found.values()))
+        return Result(txn, [Alloc(i, c, "RETURNED") for i, c in allocs], rule="returned_transfer")
 
     def process(self, r: dict) -> Result:
         txn = r["bank_txn_id"]
@@ -482,6 +517,9 @@ class Engine:
             )
             if cat in ("CASH_POOL", "INTERNAL_TRANSFER", "INTERCOMPANY", "FX_DEAL"):
                 return Result(txn, category=cat, rule="own_account")
+        dup_refund = duplicate_refund_category(text, receipt)
+        if dup_refund:
+            return Result(txn, category=dup_refund, rule="duplicate_refund")
         learned = self.cats.strong(r)
         if learned:
             exc = "UNIDENTIFIED" if learned == "UNIDENTIFIED" else ""
@@ -503,7 +541,8 @@ class Engine:
             if ctx.payer_country and ctx.payer_country not in SEPA and ctx.payer_country != own:
                 ctx.international = True
         if RETURN_RX.search(ftext):
-            res = self._returned(r, ctx, parties, receipt)
+            res = self._reversal(r, ctx) if receipt else None
+            res = res or self._returned(r, ctx, parties, receipt)
             if res:
                 return self._finish(res)
         res = self._by_reference(r, ctx, text, parties, scope, receipt)
@@ -847,6 +886,15 @@ class Engine:
             ids = [i for i in ids if i in strong or abs(self.book.open[i] - ctx.cash_c) <= 1]
         if fam:
             own = [i for i in ids if self.book.items[i].party in fam]
+            if not own and len(parties) > 3:
+                # homonyms tie on the name score and the id decides: a FULL printed number that
+                # belongs to one of the other name matches identifies the payer
+                ext: set[str] = set()
+                for p in parties[3:8]:
+                    ext |= self.parties.family(p)
+                own = [i for i in ids if i in strong and self.book.items[i].party in ext]
+                if own:
+                    fam |= ext
             # payer known but the reference points to someone else: only trust it when the
             # amount matches exactly (agencies / confirming banks quote the debtor's invoice)
             ids = own or [i for i in ids if abs(self.book.open[i] - ctx.cash_c) <= 1]
@@ -896,10 +944,14 @@ class Engine:
         party_credits = [
             i for i in self.book.open_items(party, ctx.booking) if self.book.items[i].is_credit
         ]
-        for combo in (open_inv + credits, open_inv + party_credits):
+        for combo, uncited in ((open_inv + credits, False), (open_inv + party_credits, True)):
             res = settle(
                 self.book, list(dict.fromkeys(combo)), ctx, self.fx, self.terms, allow_partial=False
             )
+            # POLICIES §3: OVERPAYMENT is an excess over ONE invoice; with credit notes we were
+            # not told about it is only a guess that the cash includes them
+            if res and uncited and any(a.exception == "OVERPAYMENT" for a in res):
+                continue
             if res:
                 return Result(r["bank_txn_id"], res, rule="ref_set")
         # cash exceeds the cited invoices: the text was truncated, complete with the party's
@@ -999,6 +1051,25 @@ class Engine:
                         [Alloc(i, self.book.open[i], "SHORT_DISCOUNT")],
                         rule="party_discount",
                     )
+            # (b1) discount taken AFTER the deadline on a single invoice: not accepted, the
+            # difference stays open -> PARTIAL with the cash applied (POLICIES §3)
+            if rank == 0:
+                late = []
+                for i in inv:
+                    d, within = discount_c(self.book.items[i], self.terms, ctx.booking)
+                    if (
+                        d
+                        and not within
+                        and self.book.items[i].ccy == ctx.ccy
+                        and abs(self.book.open[i] - d - ctx.cash_c) <= 1
+                    ):
+                        late.append(i)
+                if len(late) == 1:
+                    return Result(
+                        r["bank_txn_id"],
+                        [Alloc(late[0], ctx.cash_c, "PARTIAL")],
+                        rule="party_discount_late",
+                    )
             # (b2) one instalment / the payable amount after retention or advance (invoice PDF)
             for i in inv:
                 if (
@@ -1010,6 +1081,29 @@ class Engine:
                         r["bank_txn_id"],
                         [Alloc(i, ctx.cash_c, "PARTIAL" if rest > 1 else "")],
                         rule="party_plan",
+                    )
+            # (b3) payment on account without reference: a round share (25-70 %, pattern measured
+            # on TRAIN) of ONE untouched invoice of the likeliest payer; PARTIAL with the cash
+            if rank == 0:
+                # the customer may be paying the invoice NET of an open credit note of its own
+                # (the golden then clears both): that explanation comes first
+                credits_open = [self.book.open[c] for c in open_ids if self.book.items[c].is_credit]
+                share = [
+                    i
+                    for i in inv
+                    if self.book.open[i] == self.book.items[i].total
+                    and self.book.items[i].ccy == ctx.ccy
+                    and any(
+                        abs(round(self.book.items[i].total * f) - ctx.cash_c) <= 1
+                        for f in PARTIAL_SHARES
+                    )
+                    and not any(abs(self.book.open[i] - c - ctx.cash_c) <= 2 for c in credits_open)
+                ]
+                if len(share) == 1:
+                    return Result(
+                        r["bank_txn_id"],
+                        [Alloc(share[0], ctx.cash_c, "PARTIAL")],
+                        rule="party_partial_share",
                     )
             # (c) the customer pays its oldest open items (FIFO by due date, then issue date)
             for target, tol in self._targets(ctx):

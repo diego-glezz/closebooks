@@ -34,6 +34,23 @@ def coarse(amount_c: int, bank_code: str, bank_subcode: str) -> str:
     return f"{'+' if amount_c > 0 else '-'}|{bank_code}|{bank_subcode}"
 
 
+def _fee_table(con, folder: str, before: str, min_n: int = 5) -> dict[str, list[int]]:
+    """Shortfalls (cents, account currency) that the golden labels SHORT_BANK_CHARGES, per
+    currency: intermediary banks deduct a fixed fee schedule, so the shortfall repeats."""
+    rows = con.execute(f"""
+        select b.currency, g.amount, b.amount
+        from read_csv_auto('{folder}/golden_allocations.csv.gz', all_varchar=true) g
+        join read_csv_auto('{folder}/bank_transactions.csv.gz', all_varchar=true) b
+          using(bank_txn_id)
+        where g.exception = 'SHORT_BANK_CHARGES' and b.booking_date < '{before}'""").fetchall()
+    counts: dict[str, Counter] = defaultdict(Counter)
+    for ccy, item_amount, bank_amount in rows:
+        short = round(float(item_amount) * 100) - abs(round(float(bank_amount) * 100))
+        if short > 0:
+            counts[ccy][short] += 1
+    return {ccy: sorted(v for v, n in c.items() if n >= min_n) for ccy, c in sorted(counts.items())}
+
+
 def build(root: Path, before: str, out: Path) -> dict:
     import duckdb
 
@@ -76,7 +93,12 @@ def build(root: Path, before: str, out: Path) -> dict:
             }
         return out_t
 
-    model = {"before": before, "fine": summarize(fine, 5), "coarse": summarize(rough, 20)}
+    model = {
+        "before": before,
+        "fine": summarize(fine, 5),
+        "coarse": summarize(rough, 20),
+        "fees": _fee_table(con, folder, before),
+    }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(model), encoding="utf-8")
     return model
@@ -86,9 +108,11 @@ class CategoryModel:
     def __init__(self, path: Path | None):
         self.fine: dict = {}
         self.coarse: dict = {}
+        self.fees: dict[str, list[int]] = {}
         if path and path.exists():
             m = json.loads(path.read_text(encoding="utf-8"))
             self.fine, self.coarse = m["fine"], m["coarse"]
+            self.fees = m.get("fees", {})
 
     def strong(self, r: dict) -> str | None:
         """Category to use BEFORE item matching: the shape almost never settles items."""
