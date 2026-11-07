@@ -31,6 +31,7 @@ class Item:
     po: str
     method: str
     related: str
+    reason: str = ""  # credit notes: "Anulación de factura", "Devolución / rectificación"...
 
     @property
     def is_credit(self) -> bool:
@@ -64,6 +65,7 @@ class Book:
                 r.po,
                 r.method,
                 r.related,
+                str(getattr(r, "reason", "") or ""),
             )
             self.items[it.id] = it
             self.open[it.id] = int(r.open_c)

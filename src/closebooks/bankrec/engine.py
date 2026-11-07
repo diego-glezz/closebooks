@@ -115,6 +115,16 @@ def _fix_set(
     return sols[0] if len(sols) == 1 else None
 
 
+def _run_total_in(rows: list[dict], ccy: str, day: str, fx: FX) -> int:
+    """Total of a payment run in the currency of the debtor account: documents in another
+    currency converted at the reference rate of the execution day (credit notes are negative)."""
+    total = 0
+    for row in rows:
+        c = int(row["doc_c"])
+        total += c if row["currency"] == ccy else (fx.convert(c, row["currency"], ccy, day) or 0)
+    return total
+
+
 def _overpay_pattern(excess: int, total: int) -> bool:
     """Excess of an overpayment as customers make it: a round amount or 1 % / 10 % of the bill."""
     if excess <= 0:
@@ -158,6 +168,7 @@ class Engine:
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
+        self._cancel_by_reason()
         step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
         self._link_details()
 
@@ -217,6 +228,21 @@ class Engine:
                     if old in self.book.cancelled:
                         self.book.cancelled.add(iid)
 
+    def _cancel_by_reason(self) -> None:
+        """POLICIES §5.7: an invoice cancelled by a credit note, and that credit note, are never
+        settled by bank. The PDF ("anula y sustituye") only covers a subset; the credit note's
+        own reason ("Anulación de factura") says it too. In TRAIN the bank never settles those
+        credit notes, and almost never their invoice: left open, they pair up into zero-sum
+        combinations that make every subset search ambiguous."""
+        for iid in sorted(self.book.items):
+            it = self.book.items[iid]
+            if it.is_credit and "ANULACION" in fold(it.reason):
+                self.book.cancelled.add(iid)
+                if it.related:
+                    self.book.cancelled.update(
+                        self._carried(it.related, it.side, {it.entity}, it.issue)
+                    )
+
     def _carried(self, number: str, side: str, entities: set[str], before: str) -> list[str]:
         """Items with exactly this printed number (no noisy keys), issued on or before `before`."""
         return [
@@ -269,6 +295,12 @@ class Engine:
                 if len(tok) >= 10:
                     self.tok_idx[tok].append(i)
             self.amt_idx[(r["account_id"], int(r["amount_c"]))].append(i)
+        # instructed amount of lines in another currency: (account, |orig cents|, orig currency)
+        self.orig_idx: dict[tuple[str, int, str], list[int]] = defaultdict(list)
+        for i, r in enumerate(self.rows):
+            if int(r["orig_amount_c"] or 0):
+                key = (r["account_id"], abs(int(r["orig_amount_c"])), r["orig_currency"])
+                self.orig_idx[key].append(i)
 
     def _link_confirming(self, conf: pd.DataFrame) -> None:
         """Confirming: the bank debits, per maturity date, the transfers of the run that fall due
@@ -457,6 +489,7 @@ class Engine:
                     if t not in self.linked and int(self.rows[i]["amount_c"]) < 0:
                         conf = runs[runs["run_id"] == g0["run_id"]].to_dict("records")
                         self.linked[t] = ("confirming", conf)
+            self._link_fx_runs(runs)
         # --- direct-debit batches
         if not ph.dd.empty:
             dd = ph.dd.copy()
@@ -536,6 +569,80 @@ class Engine:
                             in fold(self.rows[i]["text"] + " " + self.rows[i]["counterparty_name"])
                         ]
                 self._claim(cands, "advice", adv, day, 15, 15)
+            self._link_fx_advices(advices)
+
+    def _link_fx_runs(self, runs: pd.DataFrame) -> None:
+        """Second pass for payment runs paid in another currency than the debtor account
+        (POLICIES §3 FX): the first pass compares the debit with amounts in document currency,
+        which never matches. A transfer is the debit whose instructed amount is the transfer
+        amount; an aggregated file is the ONE debit citing the run whose amount is the run total
+        with the foreign documents converted at the reference rate of the execution day."""
+        if runs.empty:
+            return
+        key = runs["end_to_end_id"].where(
+            runs["run_type"] == "transfers", runs["run_id"] + "|" + runs["execution_date"]
+        )
+        for (rtype, _k), g in runs.groupby([runs["run_type"], key]):
+            g0 = g.iloc[0]
+            acct, day = g0["debtor_account_id"], g0["execution_date"]
+            accy = self.acc_ccy.get(acct, "")
+            if not accy or (g["currency"] == accy).all():
+                continue  # same currency: handled by the first pass
+            payload = g.to_dict("records")
+            if rtype == "transfers":
+                xc, ccy = abs(int(g0["xfer_c"])), g0["currency"]
+                cands = [
+                    i
+                    for i in self.tok_idx.get(alnum(g0["end_to_end_id"]), [])
+                    if int(self.rows[i]["amount_c"]) < 0
+                    and abs(int(self.rows[i]["orig_amount_c"] or 0)) == xc
+                    and self.rows[i]["orig_currency"] == ccy
+                ]
+                cands = cands or self.orig_idx.get((acct, xc, ccy), [])
+                self._claim(cands, "run", payload, day, 2, 6)
+            else:
+                expected = _run_total_in(payload, accy, day, self.fx)
+                cands = [
+                    i
+                    for i in self.tok_idx.get(alnum(g0["run_id"]), [])
+                    if int(self.rows[i]["amount_c"]) < 0
+                    and abs(-int(self.rows[i]["amount_c"]) - expected) <= max(100, 0.003 * expected)
+                ]
+                if len(cands) == 1:
+                    self._claim(cands, "run", payload, day, 2, 6)
+
+    def _link_fx_advices(self, advices: list[Advice]) -> None:
+        """Second pass for advices of receipts in another currency: the advice is in invoice
+        currency, so it matches the instructed amount (orig_amount) of the bank line, not the
+        account-currency amount; the reference (e.g. "REM/2025/2529") is split by "/" in the
+        token index, so the payer's name or the whole reference in the text corroborates it."""
+        linked = {v[1].file for v in self.linked.values() if v[0] == "advice"}
+        by_orig: dict[int, list[int]] = defaultdict(list)
+        for i, r in enumerate(self.rows):
+            if (
+                int(r["amount_c"]) > 0
+                and int(r["orig_amount_c"] or 0)
+                and r["orig_currency"] != r["currency"]
+            ):
+                by_orig[abs(int(r["orig_amount_c"]))].append(i)
+        for adv in advices:
+            if not adv.lines or adv.file in linked:
+                continue
+            ref = alnum(adv.ref)
+            payer = fold(adv.payer).split()
+            first = alnum(payer[0]) if payer else ""
+            cands: list[int] = []
+            for amt in sorted({adv.paid_total, adv.total_c or 0} - {0}):
+                for i in by_orig.get(abs(amt), []):
+                    r = self.rows[i]
+                    blob = alnum(
+                        " ".join(
+                            str(r[c]) for c in ("text", "remittance_info", "counterparty_name")
+                        )
+                    )
+                    if (len(ref) >= 6 and ref in blob) or (first and first in blob):
+                        cands.append(i)
+            self._claim(cands, "advice", adv, adv.pay_date or adv.received, 15, 15)
 
     # ================================================================ per line
 
@@ -723,6 +830,7 @@ class Engine:
             own = self.entity_country.get(r["entity"], "")
             if ctx.payer_country and ctx.payer_country not in SEPA and ctx.payer_country != own:
                 ctx.international = True
+            ctx.domestic = bool(ctx.payer_country and ctx.payer_country == own)
         if RETURN_RX.search(ftext):
             res = self._reversal(r, ctx) if receipt else None
             res = res or self._returned(r, ctx, parties, receipt)
@@ -744,6 +852,9 @@ class Engine:
         res = self._by_party(r, ctx, text, parties, receipt)
         if res:
             return self._finish(res)
+        res = self._by_homonym(r, ctx, scope, receipt)
+        if res:
+            return self._finish(res)
         guess = self.cats.fallback(r)
         if guess:
             exc = "UNIDENTIFIED" if guess == "UNIDENTIFIED" else ""
@@ -759,6 +870,22 @@ class Engine:
     # ---------------------------------------------------------------- strategies
 
     def _from_link(self, r: dict, ctx: Ctx, kind: str, payload) -> Result | None:
+        """Allocations from a linked detail file. In a payment run, a document in another
+        currency than the debtor account is cleared with FX_DIFFERENCE (POLICIES §3; credit
+        notes stay empty, PARTIAL / SHORT_DISPUTE keep their code)."""
+        res = self._from_link_rows(r, ctx, kind, payload)
+        if res and kind == "run":
+            res.allocs = [
+                Alloc(a.item, a.amount_c, "FX_DIFFERENCE")
+                if a.exception == ""
+                and not self.book.items[a.item].is_credit
+                and self.book.items[a.item].ccy != r["currency"]
+                else a
+                for a in res.allocs
+            ]
+        return res
+
+    def _from_link_rows(self, r: dict, ctx: Ctx, kind: str, payload) -> Result | None:
         txn = r["bank_txn_id"]
         ent = r["entity"]
         allocs: list[Alloc] = []
@@ -816,6 +943,11 @@ class Engine:
             for row in payload:
                 amt = abs(round(float(row["document_amount"]) * 100))
                 sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
+                iban_known = bool(sup)
+                if not sup and row.get("beneficiary"):
+                    # aggregated files often leave the IBAN empty: the beneficiary NAME still
+                    # says which supplier it is (supplier numbers repeat across suppliers)
+                    sup = self._suppliers_named(row["beneficiary"], ents)
                 ids: list[str] = []
                 for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
                     ids += [
@@ -825,22 +957,28 @@ class Engine:
                         )
                         if i not in self.book.cancelled and i not in ids
                     ]
-                if not ids and not sup:  # unknown beneficiary IBAN: any supplier's document
+                if not ids and not iban_known:  # unknown beneficiary IBAN: any supplier's doc
                     ids = self.book.find_number(row["document_number"], side="AP", entities=ents)
                 if ids:
                     cands.append((row, amt, ids))
+
             # supplier numbers repeat across suppliers: prefer the supplier that owns most of
-            # the documents of this transfer (decided on the exact-amount matches)
+            # the documents paid to the SAME beneficiary (decided on the exact-amount matches);
+            # an aggregated file pays hundreds of beneficiaries, so a run-wide vote means nothing
+            def bkey(row: dict) -> str:
+                return alnum(row.get("beneficiary_iban")) or fold(row.get("beneficiary") or "")
+
             votes = Counter(
-                self.book.items[i].party
-                for _r, a, ids in cands
+                (bkey(rw), self.book.items[i].party)
+                for rw, a, ids in cands
                 for i in ids
                 if abs(self.book.items[i].total - a) <= 1
             )
-            for _row, amt, ids in cands:
+            for row, amt, ids in cands:
+                b = bkey(row)
                 ids.sort(
-                    key=lambda i: (
-                        -votes.get(self.book.items[i].party, 0),
+                    key=lambda i, b=b: (
+                        -votes.get((b, self.book.items[i].party), 0),
                         self.book.open[i] == 0,
                         abs(self.book.items[i].total - amt),
                         i,
@@ -865,6 +1003,13 @@ class Engine:
         if kind == "advice":
             return self._from_advice(r, ctx, payload)
         return None
+
+    def _suppliers_named(self, name: str, entities: set[str]) -> list[str]:
+        """Suppliers whose name best matches `name` (all of those tied on the best score)."""
+        ranked = self.parties.by_name(name, entities)
+        if not ranked:
+            return []
+        return sorted(p for p, s in ranked if s == ranked[0][1])
 
     def _item_for(
         self,
@@ -1117,11 +1262,11 @@ class Engine:
                 return self._why(txn, "weak_refs_unknown_payer")
         if fam:
             own = [i for i in ids if self.book.items[i].party in fam]
-            if not own and len(parties) > 3:
+            if not own and len(parties) > FLAGS.fam_parties:
                 # homonyms tie on the name score and the id decides: a FULL printed number that
                 # belongs to one of the other name matches identifies the payer
                 ext: set[str] = set()
-                for p in parties[3:8]:
+                for p in parties[FLAGS.fam_parties : 8]:
                     ext |= self.parties.family(p)
                 own = [i for i in ids if i in strong and self.book.items[i].party in ext]
                 if own:
@@ -1502,15 +1647,63 @@ class Engine:
                     return Result(r["bank_txn_id"], res, rule="party_short")
         return None
 
+    def _by_homonym(self, r: dict, ctx: Ctx, scope: set[str], receipt: bool) -> Result | None:
+        """The master has many customers with the same name (up to dozens), all tied on the name
+        score, and the tie is broken by id: the real payer can sit far beyond the top 8 that
+        _by_party looks at. Last resort before giving up: among ALL the tied customers, accept
+        the payment only when exactly one open invoice has this exact amount."""
+        blob = " ".join([r["text"], r["counterparty_name"], r["remittance_info"]])
+        joined = blob.replace(" | ", "") + " " + blob.replace("|", " ")
+        ranked = self.parties.by_name(joined, scope)
+        if len(ranked) < 2:
+            return None
+        tied = [p for p, s in ranked if s == ranked[0][1]]
+        side = "AR" if receipt else "AP"
+        kinds = self._sides(receipt)
+        found = [
+            i
+            for p in sorted(tied)
+            for i in self.book.open_items(p, ctx.booking)
+            if self.book.items[i].kind in kinds
+            and self.book.items[i].side == side
+            and not self.book.items[i].is_credit
+            and self.book.items[i].ccy == ctx.ccy
+            and abs(self.book.open[i] - ctx.cash_c) <= 1
+        ]
+        if len(found) != 1:
+            return None
+        res = settle(self.book, found, ctx, self.fx, self.terms, allow_partial=False)
+        if res and all(a.exception == "" for a in res):
+            return Result(r["bank_txn_id"], res, rule="party_amount_homonym")
+        return None
+
     # ================================================================ helpers
 
     def _targets(self, ctx: Ctx) -> list[tuple[int, int]]:
         """Cash to explain, plus the gross amount before withholding at source for payers in
         withholding countries (POLICIES §3: 1.25 / 1.5 / 10 % of the invoice total)."""
-        out = [(ctx.cash_c, 1)]
+        cash = self._line_cash(ctx)
+        out = [(cash, 1)]
         if ctx.payer_country in WITHHOLDING_COUNTRIES:
-            out += [(round(ctx.cash_c / (1 - rate / 100)), 25) for rate in WITHHOLDING_RATES]
+            out += [(round(cash / (1 - rate / 100)), 25) for rate in WITHHOLDING_RATES]
         return out
+
+    @staticmethod
+    def _fx_orig(ctx: Ctx) -> bool:
+        """Bank line in another currency than its account whose instructed amount (the invoice
+        currency amount, POLICIES §3) is known."""
+        return bool(ctx.orig_c and ctx.orig_ccy and ctx.orig_ccy != ctx.ccy)
+
+    def _line_cash(self, ctx: Ctx) -> int:
+        """Cash to explain, in the currency of the items it settles."""
+        return ctx.orig_c if self._fx_orig(ctx) else ctx.cash_c
+
+    def _in_line_ccy(self, ids: list[str], ctx: Ctx) -> list[str]:
+        """For an FX line with a known instructed amount only items in that currency can add up
+        to it; otherwise the pool is left as it is."""
+        if not self._fx_orig(ctx):
+            return ids
+        return [i for i in ids if self.book.items[i].ccy == ctx.orig_ccy]
 
     def _unique_subset_alloc(
         self,
@@ -1524,7 +1717,7 @@ class Engine:
         cap = FLAGS.subset_cap if cap is None else cap
         max_items = FLAGS.subset_max_items if max_items is None else max_items
         lo = (_d(ctx.booking) - timedelta(days=recent_days)).isoformat()
-        pool = [i for i in open_ids if self.book.items[i].issue >= lo]
+        pool = [i for i in self._in_line_ccy(open_ids, ctx) if self.book.items[i].issue >= lo]
         pool = sorted(pool, key=lambda i: (self.book.items[i].issue, i), reverse=True)[:cap]
         if len(pool) < 2:
             return None
@@ -1613,12 +1806,15 @@ class Engine:
         FIFO prefixes (by due date and by issue date, with/without credit notes) first,
         then small subsets."""
         fam = self.parties.family(party)
-        pool = [
-            i
-            for q in sorted(fam)
-            for i in self.book.open_items(q, ctx.booking, side)
-            if i not in exclude
-        ]
+        pool = self._in_line_ccy(
+            [
+                i
+                for q in sorted(fam)
+                for i in self.book.open_items(q, ctx.booking, side)
+                if i not in exclude
+            ],
+            ctx,
+        )
         if FLAGS.stale_days:  # invoices open for ages are dead: nobody pays them any more
             lo = (_d(ctx.booking) - timedelta(days=FLAGS.stale_days)).isoformat()
             pool = [i for i in pool if self.book.items[i].issue >= lo]
