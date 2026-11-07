@@ -51,6 +51,9 @@ class Flags:
     # ref_partial: late discount on ONE invoice, remainder on the LAST cited invoice, last
     # instalment / dispute settlement without exception (role C, 7 nov)
     ref_partial_v2: bool = True
+    # truncated citation completed with the UNIQUE subset of the payer's other open items
+    # (issued in 240 days, due by payment + 15) when the FIFO / small-subset completion fails
+    ref_due_complete: bool = True
     pdf_exact: bool = False  # PDF clauses only apply to the item with the exact printed number
     pdf_dated: bool = False  # PDF clauses never touch items issued after the PDF's own date
 

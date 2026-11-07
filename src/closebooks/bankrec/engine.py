@@ -1297,6 +1297,30 @@ class Engine:
                 )
                 if res:
                     return Result(r["bank_txn_id"], res, rule="ref_completed")
+        if FLAGS.ref_due_complete:
+            for target, tol in self._targets(ctx):
+                if target <= cited + 1:
+                    continue
+                extra = self._due_complete(
+                    party,
+                    ctx,
+                    set(open_inv + credits),
+                    target - cited,
+                    "AR" if receipt else "AP",
+                    tol,
+                )
+                if extra is None:
+                    continue
+                res = settle(
+                    self.book,
+                    open_inv + credits + extra,
+                    ctx,
+                    self.fx,
+                    self.terms,
+                    allow_partial=False,
+                )
+                if res:
+                    return Result(r["bank_txn_id"], res, rule="ref_due_completed")
         if 1 < len(open_inv) <= 12:
             for k in range(len(open_inv) - 1, 0, -1):
                 for sub in itertools.combinations(open_inv, k):
@@ -1886,6 +1910,49 @@ class Engine:
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:
                         return list(sub)
         return None
+
+    def _due_complete(
+        self,
+        party: str,
+        ctx: Ctx,
+        exclude: set[str],
+        target: int,
+        side: str,
+        tol: int = 1,
+        cap: int = 30,
+    ) -> list[str] | None:
+        """The rest of a truncated citation (the text only had room for SOME invoices): the ONLY
+        combination of the payer's other open items (invoices and credit notes netted) that adds
+        up to the uncited cash. Pool = what a customer actually pays: issued in the last 240 days
+        and due by the payment date + 15 days; every combination is counted (meet in the middle)
+        and the completion is only accepted when it is unique."""
+        lo = (_d(ctx.booking) - timedelta(days=240)).isoformat()
+        hi = (_d(ctx.booking) + timedelta(days=15)).isoformat()
+        fam = self.parties.family(party)
+        pool = self._in_line_ccy(
+            [
+                i
+                for q in sorted(fam)
+                for i in self.book.open_items(q, ctx.booking, side)
+                if i not in exclude
+            ],
+            ctx,
+        )
+        pool = [
+            i
+            for i in dict.fromkeys(pool)
+            if self.book.items[i].issue >= lo and self.book.items[i].due <= hi
+        ]
+        if not pool or len(pool) > cap:
+            return None
+        pool.sort(key=lambda i: (self.book.items[i].due, self.book.items[i].issue, i))
+        sols = subset_solutions([self._signed(i) for i in pool], target, tol)
+        if not sols or len(sols) != 1:
+            return None
+        ids = [pool[k] for k in sols[0]]
+        if all(self.book.items[i].is_credit for i in ids):
+            return None
+        return ids
 
     # ================================================================ run
 

@@ -696,3 +696,30 @@ def test_final_masters_are_united_with_the_previous_ones(tmp_path):
     assert cust.loc["C1", "name"] == "New Name"  # the final version wins on the same key
     assert sorted(final.entities["entity"]) == ["ES01", "ZA01"]
     assert len(load_masters(tmp_path, "live").customers) == 2  # other phases: masters/ only
+
+
+def test_truncated_citation_is_completed_by_the_unique_due_subset():
+    """ref_due_complete: the uncited rest is the ONLY combination of the payer's open items
+    issued in 240 days and due by payment + 15 that adds up; ambiguous or stale -> abstain."""
+    from types import SimpleNamespace
+
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 100000, "2025-05-01"),  # cited
+        ("ARI-2025-0000002", "FV25-2", 41300, "2025-05-03"),
+        ("ARI-2025-0000003", "FV25-3", 27150, "2025-05-08"),
+        ("ARI-2025-0000004", "FV25-4", 9990, "2025-05-12"),
+        ("ARC-2025-0000005", "AB25-1", 1250, "2025-05-20"),
+        ("ARI-2024-0000006", "FV24-9", 27150, "2024-06-01"),  # too old for the pool
+        ("ARI-2025-0000007", "FV25-7", 41300, "2025-07-30"),  # not issued yet
+    )
+    engine, fake = _fake_engine(b)
+    fake.parties = SimpleNamespace(family=lambda p: {p})
+    fake._in_line_ccy = lambda ids, c: ids
+    cited = {"ARI-2025-0000001"}
+    got = engine._due_complete(fake, "C1", ctx(0), cited, 41300 + 27150 - 1250, "AR")
+    assert got == ["ARI-2025-0000002", "ARI-2025-0000003", "ARC-2025-0000005"]
+    # two different combinations ({41300} and {27150 + 14150}) make it ambiguous: abstain
+    b.open["ARI-2025-0000004"] = 41300 - 27150
+    assert engine._due_complete(fake, "C1", ctx(0), cited, 41300, "AR") is None
+    # nothing adds up: abstain
+    assert engine._due_complete(fake, "C1", ctx(0), cited, 12345, "AR") is None
