@@ -362,6 +362,21 @@ def test_returned_never_reopens_more_than_the_document():
     assert book.open[iid] == 100000
 
 
+def test_confirming_debit_set_needs_exact_amount_and_supplier_count():
+    from closebooks.bankrec.engine import _fix_set
+
+    amt = {"a": 100, "b": 250, "c": 400, "d": 75, "e": 999}
+    assert _fix_set(["a", "b", "c"], [], amt, 750, 3) == ["a", "b", "c"]
+    assert _fix_set(["a", "b", "c"], [], amt, 750, 2) is None  # amount right, count wrong
+    # one overdue transfer belongs to a later debit: take it out
+    assert _fix_set(["a", "b", "c", "e"], [], amt, 750, 3) == ["a", "b", "c"]
+    # one transfer due in the next days is paid already: add it
+    assert _fix_set(["a", "b"], ["d", "e"], amt, 425, 3) == ["a", "b", "d"]
+    # two different ways to fix it: refuse
+    amb = {"a": 100, "b": 100, "c": 300}
+    assert _fix_set(["a", "b", "c"], [], amb, 400, 2) is None
+
+
 def test_pdf_payment_plans():
     c = parse_clauses(
         "Forma de pago: 3 vencimientos a 60/90/120 dias (642,98 / 642,98 / 642,99 EUR)."
