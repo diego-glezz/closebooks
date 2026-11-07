@@ -6,7 +6,7 @@ POST /api/submissions/{id}/score -> GET /api/submissions/{id} every >= 5 s until
 Safety rails:
   * token only from the HK_TOKEN env var (or .env); never printed or logged
   * the file is validated locally with the official scorer BEFORE asking for an upload URL
-    (asking for the URL already consumes a slot: 1 per 3 min, 20 per day per phase)
+    (asking for the URL already consumes a slot: 1 per 10 s, 100,000 per day per phase)
   * identical file (same sha256) already ACCEPTED by the server -> refused unless --force
     (a failed attempt, e.g. a 429, does not block resending the same file)
   * FINAL needs an explicit typed confirmation: ONE scored submission per team

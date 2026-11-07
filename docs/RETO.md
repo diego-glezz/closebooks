@@ -28,7 +28,7 @@ Para cada fase (TRAIN, LIVE y FINAL):
 | Fase | Fechas | Qué es |
 |---|---|---|
 | TRAIN | 2021-07 → 2025-06 | Datos + respuestas correctas, para aprender y medirse |
-| LIVE | 2025-07 → 2025-12 | Sin respuestas; ranking en directo (1 envío cada 3 min, 20 al día) |
+| LIVE | 2025-07 → 2025-12 | Sin respuestas; ranking en directo (1 envío cada 10 s; cuenta la mejor nota) |
 | FINAL | 2026-01 → 2026-06 | Sale a las 18:00. **Un solo envío**, cierre 19:30, resultado a las 20:30 |
 
 En LIVE y FINAL hay **cambios a propósito** (drift): un banco cambia de formato, un cliente cambia sus avisos de pago y

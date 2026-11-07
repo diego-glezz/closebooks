@@ -5,7 +5,7 @@
 |---|---|
 | 09:00 | Acreditación y café |
 | 09:30 | Presentación del reto |
-| **10:00** | **Arranca LIVE**: clasificación en directo (1 envío cada 3 min, 20 al día) |
+| **10:00** | **Arranca LIVE**: clasificación en directo (1 envío cada 10 s por fase; cuenta la mejor nota) |
 | 14:00 | Comida |
 | **18:00** | **Se publican los datos FINAL**: UN solo envío puntuado |
 | **19:30** | **Cierre de envíos** |

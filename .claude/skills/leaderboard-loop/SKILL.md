@@ -1,15 +1,18 @@
 ---
 name: leaderboard-loop
-description: Disciplina de envíos al leaderboard de Talky - límites (1 cada 3 min, 20 al día por fase, pedir URL ya gasta hueco), validación previa con el evaluador oficial, registro de cada envío, iterar con TRAIN como juez y el protocolo del FINAL de un solo tiro (18:00 datos, 19:30 cierre). Úsala antes de cualquier envío, al analizar una puntuación de LIVE o al preparar el FINAL.
+description: Disciplina de envíos al leaderboard de Talky - límites oficiales (1 envío cada 10 s y 100.000 al día por fase, pedir URL ya gasta hueco, consultar cada ≥ 5 s), validación previa con el evaluador oficial, registro de cada envío, iterar con TRAIN como juez y el protocolo del FINAL de un solo tiro (18:00 datos, 19:30 cierre). Úsala antes de cualquier envío, al analizar una puntuación de LIVE o al preparar el FINAL.
 ---
 
 # Envíos: LIVE para aprender, FINAL de un solo tiro
 
 ## Reglas que no se negocian
-- **Límites**: 1 envío cada 3 min y 20 al día **por fase**. **Pedir la URL de subida ya consume el hueco.**
+- **Límites** (https://hackathon.usetalky.com/reglas): 1 envío cada 10 s y 100.000 al día **por fase**; archivo
+  ≤ 60 MB y ≤ 3 M filas. **Pedir la URL de subida ya consume el hueco**, aunque luego no se suba el archivo.
 - **Consultar como mucho cada 5 s**: toda la sala comparte IP. `closebooks submit` ya lo respeta.
-- **FINAL**: un solo envío puntuado; un fichero rechazado por formato no cuenta y se puede reintentar. Empate → gana
-  el envío más temprano.
+- **LIVE**: cuenta la **mejor** puntuación; a igualdad, gana quien la consiguió antes. Enviar no se raciona, pero LIVE
+  no decide nada: un cambio entra por TRAIN (DEV + HOLDOUT), no porque suba en LIVE.
+- **FINAL**: un solo envío; cuenta el primer fichero válido y no se puede repetir. Un fichero con errores de formato
+  no gasta el envío. Empate → gana el envío FINAL más temprano. Sin envío FINAL no se entra en la clasificación.
 - El token solo vive en `HK_TOKEN` (`.env`). Nunca en el código, en el chat ni en un commit.
 
 ## Antes de cada envío LIVE
@@ -24,8 +27,8 @@ description: Disciplina de envíos al leaderboard de Talky - límites (1 cada 3 
    con TRAIN. Si un segmento va mucho peor en LIVE que en TRAIN → drift (skill `dataset-onboarding`).
 
 ## TRAIN es el juez, LIVE el termómetro
-TRAIN tiene golden para cuatro años y el mismo evaluador. LIVE solo da un número cada 3 min. Itera en local con
-`sample` (segundos) y `train` (minutos); usa LIVE para confirmar.
+TRAIN tiene golden para cuatro años y el mismo evaluador. LIVE solo da un número por envío y no se puede depurar
+contra él. Itera en local con `sample` (segundos) y `train` (minutos); usa LIVE para confirmar y para detectar drift.
 
 ## Protocolo FINAL (18:00 → 19:30)
 - **17:30 — congelar el código.** Etiqueta `pre-final`. Solo arreglos de robustez.

@@ -201,7 +201,7 @@ def submit(
         console.print("[bold red]FINAL: ONE scored submission per team. It cannot be undone.[/]")
         if typer.prompt("Type FINAL to confirm") != "FINAL":
             raise typer.Exit(1)
-    elif not typer.confirm("Uses one LIVE slot (1 per 3 min, 20/day). Send?"):
+    elif not typer.confirm("Asking for the upload URL uses one LIVE slot. Send?"):
         raise typer.Exit(1)
     try:
         res = do_submit(file, phase, note)
