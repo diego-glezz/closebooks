@@ -204,11 +204,14 @@ def settle(
     # intermediary bank charges: <= 60 EUR equivalent and <= 2 % of the item. Always ONE invoice
     # (0 of 1130 SBC in TRAIN span several), and when the currency has a learned fee schedule
     # the shortfall has to be one of its fees.
-    if ctx.international and len(invoices) == 1 and not late_discount:
+    known = (ctx.fees or {}).get(iccy)
+    hit = bool(known) and any(abs(diff - f) <= 2 for f in known)
+    # a non-EUR fee from the learned schedule is specific enough (e.g. 11.85 USD) to need no
+    # "international" hint; EUR fees (10, 15, 20...) are round and need it
+    if (ctx.international or (hit and iccy != "EUR")) and len(invoices) == 1 and not late_discount:
         eur = fx.convert(diff, iccy, "EUR", ctx.booking) or diff
         biggest = invoices[0][1]
-        known = (ctx.fees or {}).get(iccy)
-        on_schedule = not known or any(abs(diff - f) <= 2 for f in known)
+        on_schedule = not known or hit
         if eur <= 6000 and diff <= 0.02 * biggest and on_schedule:
             return full("SHORT_BANK_CHARGES")
     if not allow_partial:

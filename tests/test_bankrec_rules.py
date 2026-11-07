@@ -233,6 +233,21 @@ def test_bank_charges_must_follow_learned_fee_schedule():
     assert settle(b, ids, other, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
 
 
+def test_bank_charges_non_eur_fee_on_schedule_needs_no_international_hint():
+    b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01", "T30", "USD"))
+    ids = ["ARI-2025-0000001"]
+    on = ctx(191944 - 1185, ccy="USD", fees={"USD": [1185]})
+    off = ctx(191944 - 1186 * 3, ccy="USD", fees={"USD": [1185]})
+    assert settle(b, ids, on, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+    assert settle(b, ids, off, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    # the same fee in EUR is round and still needs the international hint
+    e = make_book(("ARI-2025-0000002", "FV21-2", 191944, "2025-05-01"))
+    eur = ctx(191944 - 1500, fees={"EUR": [1500]})
+    assert (
+        settle(e, ["ARI-2025-0000002"], eur, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    )
+
+
 def test_partial_payment_keeps_cash_amount():
     b = make_book(("ARI-2025-0000001", "FV22-1", 82251, "2025-05-01"))
     a = settle(b, ["ARI-2025-0000001"], ctx(20562), FX_RATES, TERMS)
