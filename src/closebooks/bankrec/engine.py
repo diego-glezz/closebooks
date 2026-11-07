@@ -86,6 +86,45 @@ def _run_total_in(rows: list[dict], ccy: str, day: str, fx: FX) -> int:
     return total
 
 
+_N_SUPPLIERS = re.compile(r"\b(\d{1,4}) PROVEEDORES\b")
+
+
+def _shift(day: str, days: int) -> str:
+    return (_d(day) + timedelta(days=days)).isoformat()
+
+
+def _fix_set(
+    base: list[str], extra: list[str], amt: dict[str, int], cash: int, n: int
+) -> list[str] | None:
+    """The set of transfers a confirming debit pays: `base` (due up to its date) when its total
+    is the cash and it has `n` transfers, else `base` with one or two transfers taken out, one
+    of `extra` (due in the next days) added, or one swapped, if exactly one such fix exists."""
+    total = sum(amt[e] for e in base)
+    diff = total - cash  # > 0: base pays too much
+    if len(base) == n and abs(diff) <= 1:
+        return list(base)
+    sols: list[list[str]] = []
+    if len(base) - 1 == n:
+        sols += [[x for x in base if x != e] for e in base if abs(amt[e] - diff) <= 1]
+    if len(base) + 1 == n:
+        sols += [[*base, e] for e in extra if abs(amt[e] + diff) <= 1]
+    if len(base) == n and len(base) * len(extra) <= 40_000:
+        sols += [
+            [*(x for x in base if x != out), inn]
+            for out in base
+            for inn in extra
+            if abs(amt[inn] - amt[out] + diff) <= 1
+        ]
+    if len(base) - 2 == n and len(base) <= 300:
+        for a in range(len(base)):
+            for b in range(a + 1, len(base)):
+                if abs(amt[base[a]] + amt[base[b]] - diff) <= 1:
+                    sols.append([x for k, x in enumerate(base) if k not in (a, b)])
+                    if len(sols) > 1:
+                        return None
+    return sols[0] if len(sols) == 1 else None
+
+
 def _overpay_pattern(excess: int, total: int) -> bool:
     """Excess of an overpayment as customers make it: a round amount or 1 % / 10 % of the bill."""
     if excess <= 0:
@@ -256,7 +295,11 @@ class Engine:
             blob = " ".join(
                 str(r[c]) for c in ("text", "ref1", "ref2", "end_to_end_id", "remittance_info")
             )
-            for tok in {alnum(w) for w in fold(blob).replace("|", " ").replace("/", " ").split()}:
+            words_ = fold(blob).replace("|", " ").split()
+            # slash-split parts, and the whole word too: "REM/2024/0616" is cited by the
+            # remittance advice as one reference (alnum "REM20240616")
+            toks = {alnum(p) for w in words_ for p in w.split("/")} | {alnum(w) for w in words_}
+            for tok in sorted(toks):
                 if len(tok) >= 6 and any(ch.isdigit() for ch in tok):
                     self.tok_idx[tok].append(i)
             e2e = alnum(r["end_to_end_id"])
@@ -307,15 +350,20 @@ class Engine:
                     pick[0]
                 ].due
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        for _e2e, g in conf.groupby("end_to_end_id"):
+        # every transfer of a run: e2e -> (maturity, transfer cents, rows)
+        transfers: dict[str, dict[str, tuple[str, int, list[dict]]]] = defaultdict(dict)
+        for e2e, g in conf.groupby("end_to_end_id"):
+            recs = g.to_dict("records")
             dues = [
-                due_by_number.get((r["beneficiary_iban"], r["document_number"]), "")
-                for r in g.to_dict("records")
+                due_by_number.get((r["beneficiary_iban"], r["document_number"]), "") for r in recs
             ]
             dues = [d for d in dues if d]
             if not dues:
                 continue
-            groups[(g.iloc[0]["run_id"], next_business(max(dues)))] += g.to_dict("records")
+            maturity = next_business(max(dues))
+            groups[(recs[0]["run_id"], maturity)] += recs
+            transfers[recs[0]["run_id"]][str(e2e)] = (maturity, int(recs[0]["xfer_c"]), recs)
+        claimed: set[tuple[str, str]] = set()  # (run_id, end_to_end_id)
         for (run_id, maturity), rows in sorted(groups.items()):
             amount = -sum({r["end_to_end_id"]: int(r["xfer_c"]) for r in rows}.values())
             cands = [
@@ -323,7 +371,10 @@ class Engine:
                 for i in self.tok_idx.get(alnum(run_id), [])
                 if int(self.rows[i]["amount_c"]) == amount
             ]
-            self._claim(cands, "run", rows, maturity, 4, 4)
+            if self._claim(cands, "run", rows, maturity, 4, 4):
+                claimed |= {(run_id, str(r["end_to_end_id"])) for r in rows}
+        # debits still unlinked: they also pay the transfers already overdue ("N PROVEEDORES")
+        self._repair_confirming(transfers, claimed)
         # fallback: a debit citing the run ("REMESA CF... 8 PROVEEDORES") that no maturity group
         # explained (due dates not found, another maturity): the ONLY set of the run's
         # transfers (one per supplier) whose total is the debit
@@ -347,6 +398,80 @@ class Engine:
                     chosen = {keys[k] for k in sols[0]}
                     payload = [x for x in recs if x["end_to_end_id"] in chosen]
                     self.linked[r["bank_txn_id"]] = ("run", payload)
+
+    def _repair_confirming(
+        self,
+        transfers: dict[str, dict[str, tuple[str, int, list[dict]]]],
+        claimed: set[tuple[str, str]],
+    ) -> None:
+        """Confirming debits still unlinked: the bank also pays, on the first possible day, the
+        transfers that were already overdue, so a debit = transfers of its run due up to its
+        booking date that no earlier debit took. Accept only an exact amount AND the number of
+        transfers printed on the debit ("42 PROVEEDORES"), allowing one or two transfers in or
+        out of that set when the fix is unique."""
+        for run_id in sorted(transfers):
+            tr = transfers[run_id]
+            cites = self.tok_idx.get(alnum(run_id), [])
+            debits = sorted(
+                (i for i in cites if int(self.rows[i]["amount_c"]) < 0),
+                key=lambda i: (self.rows[i]["booking_date"], self.rows[i]["bank_txn_id"]),
+            )
+            for i in debits:
+                r = self.rows[i]
+                if r["bank_txn_id"] in self.linked:
+                    continue
+                # the count may sit in any field (camt.053 moves texts around)
+                blob = " ".join(
+                    str(r[c] or "") for c in ("text", "ref1", "ref2", "remittance_info")
+                )
+                m = _N_SUPPLIERS.search(fold(blob))
+                if not m:
+                    continue
+                n_sup, cash, day = int(m.group(1)), -int(r["amount_c"]), r["booking_date"]
+                free = [e for e in sorted(tr) if (run_id, e) not in claimed]
+                due = [e for e in free if tr[e][0] <= day]
+                soon = [e for e in free if day < tr[e][0] <= _shift(day, 4)]
+                pick = _fix_set(due, soon, {e: tr[e][1] for e in free}, cash, n_sup)
+                if pick is None:
+                    continue
+                self.linked[r["bank_txn_id"]] = ("run", [x for e in pick for x in tr[e][2]])
+                claimed |= {(run_id, e) for e in pick}
+
+    def _advice_rank(self, i: int, adv: Advice, day: str) -> tuple:
+        """Order of the receipts citing an advice reference: amount = advice total (same
+        currency) first, then the closest booking date."""
+        r = self.rows[i]
+        cash = int(r["amount_c"])
+        same_ccy = not adv.currency or adv.currency == r["currency"]
+        targets = [t for t in (adv.paid_total, adv.total_c or 0) if t]
+        fits = same_ccy and any(abs(cash - t) <= max(100, t * 0.05) for t in targets)
+        try:
+            gap = abs((_d(r["booking_date"]) - _d(day)).days)
+        except ValueError:
+            gap = 999
+        return (not fits, gap, i)
+
+    FX_TOLERANCE = 0.03  # POLICIES §3: the bank spread is always well within 3 %
+
+    def _run_fx_close(self, g: pd.DataFrame, row: dict, day: str) -> bool:
+        """Is the bank debit `row` the run `g` paid in several currencies? Each transfer counts
+        once (transfer_amount repeats on every document of the transfer), converted to the
+        currency of the debited account at the execution date."""
+        cash = -int(row["amount_c"])
+        if cash <= 0:
+            return False
+        ccy = row["currency"]
+        expected = 0
+        for _e2e, t in g.groupby("end_to_end_id", sort=True):
+            src = t.iloc[0]["currency"] or ccy
+            cents_ = int(t.iloc[0]["xfer_c"]) or int(t["doc_c"].sum())
+            conv = cents_ if src == ccy else self.fx.convert(cents_, src, ccy, day)
+            if conv is None:
+                return False
+            expected += conv
+        if (g["currency"].replace("", ccy) == ccy).all():
+            return abs(cash - expected) <= 1  # one currency: no FX, the totals must agree
+        return expected > 0 and abs(cash - expected) <= expected * self.FX_TOLERANCE
 
     def _claim(
         self, idx: list[int], kind: str, payload: object, day: str, before: int, after: int
@@ -394,6 +519,16 @@ class Engine:
                 cands = [
                     i for i in self.tok_idx.get(tok, []) if int(self.rows[i]["amount_c"]) == amount
                 ]
+                if not cands:
+                    # the debit cites the run id but the run mixes currencies (EUR transfers from
+                    # a USD account...): compare with its transfers converted to the account
+                    # currency, within the FX tolerance of POLICIES §3
+                    cands = [
+                        i
+                        for i in self.tok_idx.get(tok, [])
+                        if self.rows[i]["account_id"] == acct
+                        and self._run_fx_close(g, self.rows[i], day)
+                    ]
                 if not cands:
                     cands = self.amt_idx.get((acct, amount), [])
                     if rtype == "transfers":
@@ -475,11 +610,19 @@ class Engine:
                     continue
                 day = adv.pay_date or adv.received
                 tok = alnum(adv.ref)
+                # advice references ("REM/2025/1173") repeat across customers and entities: keep
+                # receipts of the advice's entity, the one whose amount is the advice total first
                 cands = (
-                    [i for i in self.tok_idx.get(tok, []) if int(self.rows[i]["amount_c"]) > 0]
+                    [
+                        i
+                        for i in self.tok_idx.get(tok, [])
+                        if int(self.rows[i]["amount_c"]) > 0
+                        and (not adv.entity or self.rows[i]["entity"] == adv.entity)
+                    ]
                     if len(tok) >= 6
                     else []
                 )
+                cands.sort(key=lambda i, adv=adv, day=day: self._advice_rank(i, adv, day))
                 if not cands:
                     payer = fold(adv.payer).split()
                     first = payer[0] if payer else "#"
@@ -862,16 +1005,21 @@ class Engine:
         if kind == "run":
             ents = AP_FACTORY.get(ent, {ent})
             cands: list[tuple[dict, int, list[str]]] = []
+            named: dict[str, list[str]] = {}
             for row in payload:
                 amt = abs(round(float(row["document_amount"]) * 100))
-                sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
-                iban_known = bool(sup)
-                if not sup and row.get("beneficiary"):
+                # an empty IBAN must not match the suppliers whose IBAN is empty
+                iban = alnum(row["beneficiary_iban"])
+                sup = sorted(self.parties.by_iban.get(iban, set())) if iban else []
+                benef = str(row.get("beneficiary") or "")
+                if not sup and benef:
                     # aggregated files often leave the IBAN empty: the beneficiary NAME still
                     # says which supplier it is (supplier numbers repeat across suppliers)
-                    sup = self._suppliers_named(row["beneficiary"], ents)
+                    if benef not in named:
+                        named[benef] = self._suppliers_named(benef, ents)
+                    sup = named[benef]
                 ids: list[str] = []
-                for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
+                for p in sup:  # every supplier with that IBAN / name (they can repeat)
                     ids += [
                         i
                         for i in self.book.find_number(
@@ -879,8 +1027,23 @@ class Engine:
                         )
                         if i not in self.book.cancelled and i not in ids
                     ]
-                if not ids and not iban_known:  # unknown beneficiary IBAN: any supplier's doc
-                    ids = self.book.find_number(row["document_number"], side="AP", entities=ents)
+                if not ids and not sup:
+                    # unknown beneficiary: supplier numbers repeat across suppliers, so take a
+                    # document only if its amount agrees and it is of a single supplier
+                    tol = max(1, amt // 200)
+                    ids = [
+                        i
+                        for i in self.book.find_number(
+                            row["document_number"], side="AP", entities=ents
+                        )
+                        if i not in self.book.cancelled
+                        and (
+                            abs(self.book.items[i].total - amt) <= tol
+                            or abs(self.book.open[i] - amt) <= tol
+                        )
+                    ]
+                    if len({self.book.items[i].party for i in ids}) > 1:
+                        ids = []
                 if ids:
                     cands.append((row, amt, ids))
 
@@ -914,7 +1077,8 @@ class Engine:
                 # a run is OUR payment file: a document it pays that our book already shows as
                 # closed means an earlier allocation was wrong, not a duplicate (measured on
                 # HOLDOUT: 0 of 188 DUPLICATE_PAYMENT rows from runs were right)
-                # the run pays part of the document: the rest stays open
+                # the run pays part of the document: the rest stays open. (FX_DIFFERENCE of the
+                # documents in another currency is set by _from_link.)
                 partial = not self.book.items[iid].is_credit and amt < open_c - 1
                 allocs.append(Alloc(iid, amt, "PARTIAL" if partial else ""))
             return Result(txn, allocs, rule="link_run") if allocs else None
