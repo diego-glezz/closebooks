@@ -84,5 +84,75 @@ Para cada movimiento, responder tres preguntas:
 | **closebooks**, ventana DEV (TRAIN 2024-H2) | **85,99** |
 | **closebooks**, ventana HOLDOUT (TRAIN 2025-H1) | **85,68** |
 
+## Mini ejemplo (datos inventados)
+
+### Libro de partidas abiertas al empezar
+| Factura | Cliente | Importe | Condiciones |
+|---|---|---|---|
+| ARI-…001 (nº F-1001) | Ferretería Gómez | 1.210,00 € | 2 % de descuento si paga en 10 días (emitida el 01/03) |
+| ARI-…002 (nº F-1002) | Ferretería Gómez | 500,00 € | — |
+| ARI-…003 (nº F-1003) | Riegos Díaz | 2.000,00 € | — |
+
+El motor conoce el IBAN de Ferretería Gómez por los datos maestros.
+
+### Los movimientos, en orden de fecha
+
+**① 05/03 · −27,50 € · "COMISION MANTENIMIENTO CUENTA"**
+- El modelo aprendido y el texto dicen claramente que es una comisión.
+- → **`BANK_FEES`**, sin factura. Regla `fees`.
+
+**② 08/03 · +1.185,80 € · "TRANSF FERRETERIA GOMEZ"** (sin número de factura)
+- Pagador: el IBAN del ordenante es el de Ferretería Gómez.
+- Referencia: en el texto no hay número de factura, así que se pasa al siguiente paso.
+- Tercero + importe:
+  - ¿Hay una factura de Gómez de 1.185,80 € exactos? No.
+  - ¿Descuento por pronto pago? 1.210 − 2 % = **1.185,80**, dentro de los 10 días. ✔
+- `settle` → **ARI-…001 por 1.210,00 € con `SHORT_DISCOUNT`**. El importe es el de la factura completa, porque queda
+  saldada. Regla `party_discount`.
+- 📒 Libro: ARI-…001 pasa a **0 €**.
+
+**③ 12/03 · +1.000,00 € · "TRF RIEGOS DIAZ FRA 1003"**
+- Referencia: "1003" coincide con el nº de **ARI-…003**, de Riegos Díaz.
+- `settle`: la factura vale 2.000 y paga 1.000. No es descuento, ni retención, ni comisión.
+- → **ARI-…003 por 1.000,00 € con `PARTIAL`**. Regla `ref_partial`.
+- 📒 Libro: ARI-…003 pasa de 2.000 € a **1.000 € pendientes**.
+
+**④ 20/03 · +500,00 € · "TRANSF FERRETERIA GOMEZ"**
+- Pagador: Gómez, por el IBAN. Sin referencia.
+- Tercero + importe: ¿hay una factura **abierta** de Gómez de 500 €? Sí, ARI-…002.
+- La ARI-…001 ya no es candidata porque el libro la tiene a 0 desde el movimiento ②.
+- → **ARI-…002 por 500,00 €**, sin excepción. Regla `party_amount`.
+
+**⑤ 25/03 · +1.000,00 € · "TRF RIEGOS DIAZ FRA 1003"**
+- Referencia: otra vez ARI-…003. **El libro dice que solo quedan 1.000 €**, no 2.000.
+- `settle`: 1.000 pagados contra 1.000 pendientes, así que cuadra.
+- → **ARI-…003 por 1.000,00 €**, sin excepción. La factura queda saldada. Regla `ref_completed`.
+- Sin el saldo vivo, el motor habría visto 2.000 € pendientes y habría marcado otro `PARTIAL` por error.
+
+**⑥ 28/03 · +350,00 € · "INGRESO"**
+- No hay IBAN conocido, ni nombre, ni número de factura, y el modelo de categorías no lo reconoce.
+- Podría casarlo con cualquier factura de 350 € de cualquier cliente, pero sería adivinar.
+- → **`UNIDENTIFIED`**. Regla `unidentified`.
+
+### Lo que entregamos
+```
+bank_txn_id,item_id,amount,category,exception
+BT-1,,,BANK_FEES,
+BT-2,ARI-…001,1210.00,,SHORT_DISCOUNT
+BT-3,ARI-…003,1000.00,,PARTIAL
+BT-4,ARI-…002,500.00,,
+BT-5,ARI-…003,1000.00,,
+BT-6,,,UNIDENTIFIED,UNIDENTIFIED
+```
+
+En `explain.csv.gz` queda la regla de cada línea (`fees`, `party_discount`, `ref_partial`, `party_amount`,
+`ref_completed`, `unidentified`). Si el evaluador dice que la línea 3 está mal, sabemos qué estrategia revisar.
+
+### Las 3 ideas que enseña
+1. **Cascada:** primero lo más seguro (categoría clara, referencia) y después lo más deductivo (quién paga y cuánto).
+2. **Saldo vivo:** el movimiento ⑤ solo sale bien porque el ③ ya había bajado el saldo de la factura.
+3. **Ante la duda, no emparejar:** el ⑥ se queda como no identificado. Un emparejamiento malo resta más que admitir que
+   no se sabe.
+
 Siguiente lectura: `README.md` (instalación y comandos), `docs/PLAYBOOK.md` (roles y horario) y `CLAUDE.md` (reglas
 del proyecto).
