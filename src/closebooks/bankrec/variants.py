@@ -1,8 +1,10 @@
 """Experiment switches for role B (references and third parties).
 
-Every field defaults to the behaviour of `main` except `two_pass_party`, which is on (measured
-gain on DEV). To reproduce the old baseline pass `two_pass_party=0`. A candidate is described by a JSON object in the `CB_FLAGS` environment variable,
-which lets a genetic search launch independent processes with different genomes.
+Every field defaults to the behaviour of `main` except two switches that are ON after measuring
+them: `two_pass_party` (DEV) and `ref_cn_subset` (DEV and HOLDOUT). An empty `CB_FLAGS` reproduces
+the current engine; to get the old baseline pass `two_pass_party=0,ref_cn_subset=0`. A candidate
+is described by a JSON object in the `CB_FLAGS` environment variable, which lets a genetic search
+launch independent processes with different genomes.
 """
 
 from __future__ import annotations
@@ -35,6 +37,11 @@ class Flags:
     fam_parties: int = 3  # payers whose family filters a cited reference
     name_min_len: int = 8  # chars of a truncated name needed to accept it
     stale_days: int = 0  # 0 = off; ignore open items older than this when completing FIFO
+    # cited invoices paid net of a SUBSET of the party's credit notes; ON since 7 nov
+    # (DEV 85.99 -> 86.06, HOLDOUT 85.68 -> 85.75, pair precision 0.92 / 0.97)
+    ref_cn_subset: bool = True
+    pdf_exact: bool = False  # PDF clauses only apply to the item with the exact printed number
+    pdf_dated: bool = False  # PDF clauses never touch items issued after the PDF's own date
 
 
 def load() -> Flags:

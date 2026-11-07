@@ -124,12 +124,12 @@ class Engine:
             if dtype not in ("invoice", "supplier_invoice", "credit_note", "supplier_credit_note"):
                 continue
             side = "AR" if dtype in ("invoice", "credit_note") else "AP"
-            ids = self.book.find_number(r["document_number"], side=side, entities={r["entity"]})
+            ids = self._pdf_items(r["document_number"], side, r["entity"], r["document_date"])
             if not ids:
                 continue
             new = ids[0]
             if c.replaces:
-                for old in self.book.find_number(c.replaces, side=side, entities={r["entity"]}):
+                for old in self._pdf_items(c.replaces, side, r["entity"], r["document_date"]):
                     if old != new:
                         self.book.cancelled.add(old)
                         self.book.replaced_by[old] = new
@@ -145,6 +145,23 @@ class Engine:
                 for old in self.book.find_number(it.related, side=it.side, entities={it.entity}):
                     if old in self.book.cancelled:
                         self.book.cancelled.add(iid)
+
+    def _pdf_items(self, number: str, side: str, entity: str, day: str = "") -> list[str]:
+        """Items a PDF talks about. A PDF prints the full number, so with `pdf_exact` the noisy
+        keys (no prefix, no year...) are not used: they let an old PDF ("RE24...") hit this year's
+        invoice with the same sequence ("RE25...") and cancel it or give it a foreign plan."""
+        if FLAGS.pdf_exact:
+            return [
+                i
+                for i in self.book.by_number.get(alnum(number), [])
+                if self.book.items[i].side == side and self.book.items[i].entity == entity
+            ]
+        ids = self.book.find_number(number, side=side, entities={entity})
+        if FLAGS.pdf_dated and day:
+            # a document cannot talk about an invoice issued after it (an old "RE24..." PDF
+            # hitting this year's "RE25..." through the noisy keys)
+            ids = [i for i in ids if self.book.items[i].issue[:10] <= day[:10]]
+        return ids
 
     def _bank_indexes(self) -> None:
         b = self.ph.bank
@@ -909,6 +926,12 @@ class Engine:
             )
             if res:
                 return Result(r["bank_txn_id"], res, rule="ref_set")
+        if FLAGS.ref_cn_subset:
+            # cited invoices paid net of SOME of the party's open credit notes (POLICIES: credit
+            # notes are netted): the shortfall must be the unique subset of those credit notes
+            res = self._net_of_credits(open_inv + credits, party_credits, ctx)
+            if res:
+                return Result(r["bank_txn_id"], res, rule="ref_set_cn")
         # cash exceeds the cited invoices: the text was truncated, complete with the party's
         # other open items (oldest first, or a small subset)
         cited = sum(self._signed(i) for i in open_inv + credits)
@@ -1217,6 +1240,24 @@ class Engine:
                 if res:
                     return res
         return None
+
+    def _net_of_credits(
+        self, cited: list[str], credits: list[str], ctx: Ctx, cap: int = 16
+    ) -> list[Alloc] | None:
+        cited = list(dict.fromkeys(cited))
+        pool = [i for i in credits if i not in cited]
+        pool = sorted(pool, key=lambda i: (self.book.items[i].issue, i), reverse=True)[:cap]
+        if not pool or any(self.book.items[i].ccy != ctx.ccy for i in cited + pool):
+            return None
+        short = sum(self._signed(i) for i in cited) - ctx.cash_c
+        if short <= 1:
+            return None
+        idx = unique_subset([self.book.open[i] for i in pool], short, 1)
+        if not idx:
+            return None
+        return settle(
+            self.book, cited + [pool[k] for k in idx], ctx, self.fx, self.terms, allow_partial=False
+        )
 
     def _signed(self, iid: str) -> int:
         o = self.book.open[iid]
