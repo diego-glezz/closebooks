@@ -44,7 +44,8 @@ class Flags:
     # "UNIDENTIFIED selectivo": like unid_known_payer, but cash-like receipts (small or round
     # amount: cash deposits, POLICIES §3) keep the exception. TRAIN: real UNIDENTIFIED median
     # 591 and 22 % round; receipts that pay invoices median 10,049 and 1 % round.
-    unid_selective: bool = False
+    # ON since 2026-11-07 (merged A+B+C+D code): DEV 88.69 -> 89.22, HOLDOUT 88.56 -> 89.07
+    unid_selective: bool = True
     unid_small: int = 1000  # account-currency units under which a receipt is "cash-like"
     # --- numeric genes (default = value hard-coded in main)
     subset_recent_days: int = 240
