@@ -24,7 +24,7 @@ import pandas as pd
 
 from closebooks.bankrec.book import Book, Parties
 from closebooks.bankrec.data import Phase, cents
-from closebooks.bankrec.docs import Advice, load_advices, parse_clauses, pdf_texts
+from closebooks.bankrec.docs import Advice, load_advices, pdf_clauses
 from closebooks.bankrec.learn import CategoryModel
 from closebooks.bankrec.rules import (
     FX,
@@ -166,6 +166,7 @@ class Engine:
         self.ref_why: dict[str, str] = {}  # trace_ref: txn -> why _by_reference gave up
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
+        self.restored_advance: set[str] = set()  # carried items whose advance was re-opened
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
         self._cancel_by_reason()
@@ -178,11 +179,9 @@ class Engine:
         if self.ph.pdf_index.empty:
             return
         rows = self.ph.pdf_index.to_dict("records")
-        texts = pdf_texts(
-            self.ph.folder / "pdfs", rows, self.cache_dir / f"pdf_text_{self.ph.name}.json"
-        )
+        clauses = pdf_clauses(self.ph.folder / "pdfs", rows, self.cache_dir, self.ph.name)
         for r in rows:
-            c = parse_clauses(texts.get(r["file"], ""))
+            c = clauses[r["file"]]
             dtype = r["document_type"]
             if dtype == "bank_account_notice" and c.new_iban and r.get("party_id"):
                 self.parties.add_iban(c.new_iban, r["party_id"])
@@ -215,6 +214,14 @@ class Engine:
                     if old != new:
                         self.book.cancelled.add(old)
                         self.book.replaced_by[old] = new
+            # LIVE/FINAL opening balances (open_items_at_start) already net the proforma advance
+            # off the invoice, but the golden never applies it: the payment of the net amount is
+            # PARTIAL (POLICIES §3) and the advance stays open. Restore the full balance, as a
+            # TRAIN window (balances rebuilt from the golden) sees it.
+            item = self.book.items[new]
+            if c.advance and c.payable_c and self.book.open.get(new) == c.payable_c < item.total:
+                self.book.open[new] = item.total
+                self.restored_advance.add(new)
             if c.instalments or c.payable_c:
                 self.plan[new] = sorted(
                     set(c.instalments) | ({c.payable_c} if c.payable_c else set())
@@ -542,7 +549,9 @@ class Engine:
         # --- remittance advices (customer payments of many invoices)
         if not ph.remit_index.empty:
             advices = load_advices(
-                ph.folder / "remittance_advices", ph.remit_index.to_dict("records")
+                ph.folder / "remittance_advices",
+                ph.remit_index.to_dict("records"),
+                self.cache_dir / f"advices_{ph.name}.pkl",
             )
             pos_by_amt: dict[int, list[int]] = defaultdict(list)
             for i, r in enumerate(self.rows):

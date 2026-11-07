@@ -114,12 +114,19 @@ def main() -> None:
     ap.add_argument("--from", dest="source", type=Path, help="carpeta con los paquetes ya bajados")
     ap.add_argument("--final-sha", help="SHA-256 publicado del FINAL (a las 18:00)")
     ap.add_argument("--cache", type=Path, help="zip con la caché de texto de PDFs del equipo")
+    ap.add_argument("--data", type=Path, help="destino (defecto data/challenge)")
     ap.add_argument("--skip-train", action="store_true", help="no bajar TRAIN (657 MB)")
     args = ap.parse_args()
 
+    global DATA, DOWNLOADS
+    if args.data:
+        DATA = args.data.resolve()
+        DOWNLOADS = DATA / "_downloads"
     packages = dict(PACKAGES)
     if args.skip_train:
         packages.pop("bankrec-train.tar.gz")
+    if args.final_sha and args.data:  # ensayo: solo el FINAL (el resto ya está enlazado)
+        packages = {}
     if args.final_sha:
         packages[FINAL] = args.final_sha.strip().lower()
 
