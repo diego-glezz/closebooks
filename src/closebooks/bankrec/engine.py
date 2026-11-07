@@ -16,7 +16,7 @@ import itertools
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -1043,6 +1043,13 @@ class Engine:
             elif abs(paid - open_c) <= 1:
                 allocs.append(Alloc(iid, open_c, ""))
             else:
+                # a linked advice is explained before the payer of the bank line is looked up
+                # (ctx.payer_country is still empty): a short line with no stated deduction from a
+                # customer of a withholding country is tax withheld at source (POLICIES §3), so
+                # the country comes from the customer of the document
+                country = (
+                    ctx.payer_country or self.parties.country.get(it.party, "") or payer_country
+                )
                 one = settle(
                     self.book,
                     [iid],
@@ -1054,7 +1061,7 @@ class Engine:
                         0,
                         "",
                         ctx.international,
-                        ctx.payer_country,
+                        country,
                     ),
                     self.fx,
                     self.terms,
@@ -1695,11 +1702,34 @@ class Engine:
             and self.book.items[i].ccy == ctx.ccy
             and abs(self.book.open[i] - ctx.cash_c) <= 1
         ]
-        if len(found) != 1:
+        if len(found) == 1:
+            res = settle(self.book, found, ctx, self.fx, self.terms, allow_partial=False)
+            if res and all(a.exception == "" for a in res):
+                return Result(r["bank_txn_id"], res, rule="party_amount_homonym")
             return None
-        res = settle(self.book, found, ctx, self.fx, self.terms, allow_partial=False)
-        if res and all(a.exception == "" for a in res):
-            return Result(r["bank_txn_id"], res, rule="party_amount_homonym")
+        if found or not receipt:
+            return None
+        # no exact amount: a customer of a withholding country pays ONE invoice net of the tax
+        # withheld at source (POLICIES §3: 1.25 / 1.5 / 10 % of the total), or a customer pays
+        # one invoice plus a typical excess (_overpay_pattern). _by_party only tries these for
+        # its top payer, which may be the wrong homonym; accept only a UNIQUE fit among all.
+        hits: list[tuple[str, list[Alloc]]] = []
+        for p in sorted(tied):
+            country = self.parties.country.get(p, "")
+            for i in self.book.open_items(p, ctx.booking):
+                it = self.book.items[i]
+                if it.kind not in kinds or it.side != side or it.is_credit or it.ccy != ctx.ccy:
+                    continue
+                o = self.book.open[i]
+                if ctx.cash_c < o and country in WITHHOLDING_COUNTRIES:
+                    c2 = replace(ctx, payer_country=country)
+                    res = settle(self.book, [i], c2, self.fx, self.terms, allow_partial=False)
+                    if res and res[0].exception == "SHORT_WITHHOLDING":
+                        hits.append(("party_withholding_homonym", res))
+                elif ctx.cash_c > o and _overpay_pattern(ctx.cash_c - o, it.total):
+                    hits.append(("party_overpayment_homonym", [Alloc(i, o, "OVERPAYMENT")]))
+        if len(hits) == 1:
+            return Result(r["bank_txn_id"], hits[0][1], rule=hits[0][0])
         return None
 
     # ================================================================ helpers

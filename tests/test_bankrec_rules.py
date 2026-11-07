@@ -652,6 +652,74 @@ def test_cancelling_credit_note_and_its_invoice_are_never_settled():
     assert book.cancelled == {"ARI-2025-0000001", "ARC-2025-0000001"}  # a return stays open
 
 
+def test_advice_short_line_without_deduction_is_withholding_by_customer_country():
+    """link_advice runs before the payer of the bank line is known (ctx.payer_country empty): a
+    line paid at 98.5 % / 90 % of the gross with no stated deduction, from a customer of a
+    withholding country, is SHORT_WITHHOLDING (POLICIES §3), not PARTIAL."""
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.docs import AdviceLine
+    from closebooks.bankrec.engine import Engine
+
+    b = make_book(
+        ("ARI-2025-0000001", "NF0125000001", 555935, "2025-04-01"),
+        ("ARI-2025-0000002", "NF0125000002", 400000, "2025-04-03"),
+    )
+    country = {"C1": "BR"}
+    parties = SimpleNamespace(by_name=lambda name, ents: [], family=lambda p: {p}, country=country)
+    fake = SimpleNamespace(book=b, fx=FX_RATES, terms=TERMS, parties=parties)
+    adv = Advice(file="x.csv", entity="ES01", payer="P", received="")
+    adv.lines = [
+        AdviceLine("NF0125000001", 555935, 0, "", 555935 - 8339),  # 1.5 % withheld
+        AdviceLine("NF0125000002", 400000, 0, "", 360000),  # 10 % withheld
+    ]
+    r = {"entity": "ES01", "currency": "EUR", "bank_txn_id": "BT1"}
+    res = Engine._from_advice(fake, r, ctx(555935 - 8339 + 360000, payer_country=""), adv)
+    assert [(a.item, a.amount_c, a.exception) for a in res.allocs] == [
+        ("ARI-2025-0000001", 555935, "SHORT_WITHHOLDING"),
+        ("ARI-2025-0000002", 400000, "SHORT_WITHHOLDING"),
+    ]
+    # the same short line from a customer of a country without withholding stays PARTIAL
+    country["C1"] = "ES"
+    res = Engine._from_advice(fake, r, ctx(555935 - 8339 + 360000, payer_country=""), adv)
+    assert {a.exception for a in res.allocs} == {"PARTIAL"}
+
+
+def test_homonym_payer_net_of_withholding_only_when_unique():
+    """party_withholding_homonym: two customers share the name; only one of them has an invoice
+    whose total minus 10 % withheld is the cash (the other is the top-ranked wrong homonym)."""
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    b = make_book(
+        ("ARI-2025-0000001", "NF1", 157573, "2025-04-01"),
+        ("ARI-2025-0000002", "NF2", 99999, "2025-04-03"),
+    )
+    b.items["ARI-2025-0000002"].party = "C0"
+    b.by_party["C1"] = ["ARI-2025-0000001"]
+    b.by_party["C0"] = ["ARI-2025-0000002"]
+    parties = SimpleNamespace(
+        by_name=lambda name, ents: [("C0", 1.0), ("C1", 1.0)], country={"C0": "BR", "C1": "BR"}
+    )
+    fake = SimpleNamespace(book=b, fx=FX_RATES, terms=TERMS, parties=parties)
+    fake._sides = Engine._sides.__get__(fake)
+    r = {
+        "bank_txn_id": "BT1",
+        "text": "PIX RECEBIDO X",
+        "counterparty_name": "",
+        "remittance_info": "",
+    }
+    res = Engine._by_homonym(fake, r, ctx(141816, ccy="EUR", payer_country=""), {"ES01"}, True)
+    assert res.rule == "party_withholding_homonym"
+    assert [(a.item, a.amount_c, a.exception) for a in res.allocs] == [
+        ("ARI-2025-0000001", 157573, "SHORT_WITHHOLDING")
+    ]
+    # customers outside the withholding countries: no explanation, abstain
+    parties.country.update({"C0": "ES", "C1": "ES"})
+    assert Engine._by_homonym(fake, r, ctx(141816, payer_country=""), {"ES01"}, True) is None
+
+
 def test_aggregated_run_total_converts_foreign_documents_to_the_account_currency():
     # an EUR account pays a bulk file with USD documents: the debit is the EUR total with the
     # USD documents converted at the reference rate (1.10 USD per EUR here)
