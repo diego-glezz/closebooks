@@ -180,12 +180,22 @@ class Engine:
         due_by_number: dict[tuple[str, str], str] = {}
         for _, row in conf.drop_duplicates(["beneficiary_iban", "document_number"]).iterrows():
             sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
-            ids = self.book.find_number(
-                row["document_number"], party=sup[0] if sup else None, side="AP"
-            )
-            if ids:
+            amt = abs(int(row["doc_c"]))
+            ids: list[str] = []
+            for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
+                ids += [
+                    i
+                    for i in self.book.find_number(row["document_number"], party=p, side="AP")
+                    if i not in ids
+                ]
+            # the maturity is set by the invoices of the transfer: a credit note (its due is its
+            # issue date) or an approximate number match must not move it
+            invoices = [i for i in ids if not self.book.items[i].is_credit]
+            exact = [i for i in invoices if abs(self.book.items[i].total - amt) <= 1]
+            pick = exact or invoices[:1]
+            if pick:
                 due_by_number[(row["beneficiary_iban"], row["document_number"])] = self.book.items[
-                    ids[0]
+                    pick[0]
                 ].due
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for _e2e, g in conf.groupby("end_to_end_id"):
