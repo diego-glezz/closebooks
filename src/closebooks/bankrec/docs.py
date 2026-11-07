@@ -207,7 +207,7 @@ def load_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
 
     out: list[Advice] = []
     for r in index_rows:
-        path = (Path(r["_dir"]) if r.get("_dir") else folder) / r["file"]
+        path = Path(r["_folder"]) / r["file"] if r.get("_folder") else folder / r["file"]
         if not path.exists():
             continue
         adv = Advice(
@@ -250,10 +250,25 @@ def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, st
     texts: dict[str, str] = {}
     if cache.exists():
         texts = json.loads(cache.read_text(encoding="utf-8"))
-    missing = [r["file"] for r in index_rows if r["file"] not in texts]
-    for f in missing:
+    missing = [r for r in index_rows if r["file"] not in texts]
+    # rows of an earlier phase (LIVE/FINAL context): reuse the text already extracted for that
+    # phase's own runs (pdf_text_train_*.json...) instead of parsing thousands of PDFs again
+    for src in sorted({r["_src"] for r in missing if r.get("_src")}):
+        want = {r["file"] for r in missing if r.get("_src") == src}
+        for other in sorted(cache.parent.glob(f"pdf_text_{src}*.json")):
+            if not want:
+                break
+            seen = json.loads(other.read_text(encoding="utf-8"))
+            for f in sorted(want & seen.keys()):
+                texts[f] = seen[f]
+            want -= seen.keys()
+    for r in missing:
+        f = r["file"]
+        if f in texts:
+            continue
+        base = Path(r["_folder"]) if r.get("_folder") else folder
         try:
-            texts[f] = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(folder / f).pages)
+            texts[f] = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(base / f).pages)
         except Exception:
             texts[f] = ""
     if missing:

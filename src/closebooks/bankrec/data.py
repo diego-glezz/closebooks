@@ -226,51 +226,79 @@ def load_items(root: Path, phase: str) -> pd.DataFrame:
     return items
 
 
-# Detail files (batches, payment runs, advices) of the phases before the one we run: the bank
-# books a debit or credit days after its detail file is dated, so the first days of a phase cite
-# files that live in the previous phase's folder (evaluation windows already look back).
-PRIOR_PHASES = {"sample": ("train",), "live": ("train",), "final": ("train", "live")}
-LOOKBACK_DAYS = 120  # batches / payment runs (confirming debits come weeks later)
-ADVICE_LOOKBACK_DAYS = 20  # remittance advices (they arrive days after the cash)
+def _index(folder: Path, sub: str) -> pd.DataFrame:
+    p = folder / sub / "index.csv"
+    return _read_csv(p) if p.exists() else pd.DataFrame()
 
 
-def _prior_rows(
-    root: Path, phase: str, sub: str, col: str, start: str, back: int, pattern: str = "*.csv"
-) -> pd.DataFrame:
-    """Rows of `sub/` of the earlier phases dated in [start - back, start) (never the phase itself)."""
-    lo = (pd.Timestamp(start) - pd.Timedelta(days=back)).strftime("%Y-%m-%d")
-    frames = []
-    for prior in PRIOR_PHASES.get(phase, ()):
-        df = _concat_dir(root / prior / sub, pattern)
-        if df.empty or col not in df:
+# How far back load_window() looks for context of a TRAIN window (days before its start).
+# LIVE and FINAL get the same context from the phases before them (see _with_prior_context):
+# a payment in August can settle an invoice issued in May, whose PDF ("pago 2 de 3",
+# retention, replaces...) or payment run was published with the earlier phase.
+BATCH_CONTEXT = (  # (Phase attribute, subfolder, date column, days back)
+    ("dd", "direct_debit_batches", "collection_date", 62),
+    ("cards", "card_settlements", "settlement_date", 62),
+    ("cheques", "cheque_deposits", "deposit_date", 62),
+    ("runs", "payment_runs", "execution_date", 120),
+)
+REMIT_DAYS_BACK = 40
+PDF_DAYS_BACK = 550
+# What LIVE/FINAL take from earlier phases: everything a TRAIN window sees. (A first LIVE try also
+# lost ar_dd_batch / ar_card_settlement / ar_1toN_remittance pairs: not because of the batches, but
+# because earlier-phase PDFs "replaced" look-alike items of this phase. Engine._carried fixes it.)
+PRIOR_CONTEXT = {"dd", "cards", "cheques", "runs", "remit_index", "pdf_index"}
+
+
+def _prior_phases(phase: str) -> list[str]:
+    """Phases whose files can hold context for `phase` (train for live; train + live for final)."""
+    if phase not in ("live", "final"):
+        return []
+    return [p for p in ("train", "live") if PHASES.index(p) < PHASES.index(phase)]
+
+
+def _with_prior_context(ph: Phase, root: Path, phase: str) -> Phase:
+    """Add the documents of earlier phases that a LIVE-like TRAIN window would also see.
+
+    Rows coming from another phase keep their own `file` (no collisions between phases) and get
+    `_folder` (where the file lives) and `_src` (the phase), used by docs.pdf_texts/load_advices.
+    """
+    prior = [p for p in _prior_phases(phase) if (root / p).exists()]
+    if not prior or ph.bank.empty:
+        return ph
+    start = pd.Timestamp(ph.bank["booking_date"].min()[:10])
+
+    def since(days: int) -> str:
+        return (start - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+
+    cut = start.strftime("%Y-%m-%d")
+    for attr, sub, col, back in BATCH_CONTEXT:
+        if attr not in PRIOR_CONTEXT:
             continue
-        frames.append(df[(df[col] >= lo) & (df[col] < start)])
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def _with_prior(own: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFrame:
-    if prior.empty:
-        return own
-    if own.empty:
-        return prior.reset_index(drop=True)
-    both = pd.concat([own, prior], ignore_index=True)
-    return both.drop_duplicates(subset=[c for c in both.columns if c != "_file"]).reset_index(
-        drop=True
-    )
-
-
-def _prior_advice_index(root: Path, phase: str, start: str) -> pd.DataFrame:
-    lo = (pd.Timestamp(start) - pd.Timedelta(days=ADVICE_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    frames = []
-    for prior in PRIOR_PHASES.get(phase, ()):
-        d = root / prior / "remittance_advices"
-        if not (d / "index.csv").exists():
+        extra = []
+        for p in prior:
+            df = _concat_dir(root / p / sub)
+            if not df.empty and col in df:
+                extra.append(df[(df[col] >= since(back)) & (df[col] < cut)])
+        if extra:
+            setattr(ph, attr, pd.concat([*extra, getattr(ph, attr)], ignore_index=True))
+    for attr, sub, col, back in (
+        ("remit_index", "remittance_advices", "received_date", REMIT_DAYS_BACK),
+        ("pdf_index", "pdfs", "document_date", PDF_DAYS_BACK),
+    ):
+        if attr not in PRIOR_CONTEXT:
             continue
-        df = _read_csv(d / "index.csv")
-        df = df[(df["received_date"] >= lo) & (df["received_date"] < start)].copy()
-        df["_dir"] = d.as_posix()  # the advice file is under its own phase's folder
-        frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        extra = []
+        for p in prior:
+            df = _index(root / p, sub)
+            if not df.empty and col in df:
+                df = df[(df[col] >= since(back)) & (df[col] < cut)].copy()
+                df["_folder"] = str(root / p / sub)
+                df["_src"] = p
+                extra.append(df)
+        if extra:
+            own = getattr(ph, attr)
+            setattr(ph, attr, pd.concat([*extra, own], ignore_index=True).fillna(""))
+    return ph
 
 
 def load_phase(root: Path | str, phase: str) -> Phase:
@@ -282,42 +310,20 @@ def load_phase(root: Path | str, phase: str) -> Phase:
     bank["amount_c"] = cents(bank["amount"])
     bank["orig_amount_c"] = cents(bank["orig_amount"])
     bank = bank.sort_values(["booking_date", "bank_txn_id"]).reset_index(drop=True)
-    start = str(bank["booking_date"].min())
-    remit = (
-        _read_csv(folder / "remittance_advices" / "index.csv")
-        if (folder / "remittance_advices" / "index.csv").exists()
-        else pd.DataFrame()
-    )
-    prior_remit = _prior_advice_index(root, phase, start)
-    if not prior_remit.empty:
-        remit = pd.concat([remit, prior_remit], ignore_index=True).fillna("")
     ph = Phase(
         name=phase,
         root=root,
         masters=load_masters(root, phase),
         bank=bank,
         items=load_items(root, phase),
-        dd=_with_prior(
-            _concat_dir(folder / "direct_debit_batches"),
-            _prior_rows(root, phase, "direct_debit_batches", "collection_date", start, LOOKBACK_DAYS),
-        ),
-        cards=_with_prior(
-            _concat_dir(folder / "card_settlements"),
-            _prior_rows(root, phase, "card_settlements", "settlement_date", start, LOOKBACK_DAYS),
-        ),
-        cheques=_with_prior(
-            _concat_dir(folder / "cheque_deposits"),
-            _prior_rows(root, phase, "cheque_deposits", "deposit_date", start, LOOKBACK_DAYS),
-        ),
-        runs=_with_prior(
-            _concat_dir(folder / "payment_runs"),
-            _prior_rows(root, phase, "payment_runs", "execution_date", start, LOOKBACK_DAYS),
-        ),
-        remit_index=remit,
-        pdf_index=_read_csv(folder / "pdfs" / "index.csv")
-        if (folder / "pdfs" / "index.csv").exists()
-        else pd.DataFrame(),
+        dd=_concat_dir(folder / "direct_debit_batches"),
+        cards=_concat_dir(folder / "card_settlements"),
+        cheques=_concat_dir(folder / "cheque_deposits"),
+        runs=_concat_dir(folder / "payment_runs"),
+        remit_index=_index(folder, "remittance_advices"),
+        pdf_index=_index(folder, "pdfs"),
     )
+    ph = _with_prior_context(ph, root, phase)
     g = folder / "golden_allocations.csv.gz"
     if g.exists():
         ph.golden = _read_csv(g)
