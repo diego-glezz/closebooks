@@ -129,6 +129,7 @@ class Engine:
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
         self._load_pdf_clauses()
+        self._cancel_by_reason()
         step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
         self._link_details()
 
