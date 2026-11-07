@@ -243,6 +243,10 @@ BATCH_CONTEXT = (  # (Phase attribute, subfolder, date column, days back)
 )
 REMIT_DAYS_BACK = 40
 PDF_DAYS_BACK = 550
+# What LIVE/FINAL take from earlier phases: everything a TRAIN window sees. (A first LIVE try also
+# lost ar_dd_batch / ar_card_settlement / ar_1toN_remittance pairs: not because of the batches, but
+# because earlier-phase PDFs "replaced" look-alike items of this phase. Engine._carried fixes it.)
+PRIOR_CONTEXT = {"dd", "cards", "cheques", "runs", "remit_index", "pdf_index"}
 
 
 def _prior_phases(phase: str) -> list[str]:
@@ -268,6 +272,8 @@ def _with_prior_context(ph: Phase, root: Path, phase: str) -> Phase:
 
     cut = start.strftime("%Y-%m-%d")
     for attr, sub, col, back in BATCH_CONTEXT:
+        if attr not in PRIOR_CONTEXT:
+            continue
         extra = []
         for p in prior:
             df = _concat_dir(root / p / sub)
@@ -279,6 +285,8 @@ def _with_prior_context(ph: Phase, root: Path, phase: str) -> Phase:
         ("remit_index", "remittance_advices", "received_date", REMIT_DAYS_BACK),
         ("pdf_index", "pdfs", "document_date", PDF_DAYS_BACK),
     ):
+        if attr not in PRIOR_CONTEXT:
+            continue
         extra = []
         for p in prior:
             df = _index(root / p, sub)

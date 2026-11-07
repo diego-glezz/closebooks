@@ -85,3 +85,22 @@ def test_pdf_texts_reuses_the_cache_of_the_source_phase(tmp_path):
     assert texts["ES01/may.pdf"] == "pago 2 de 3"  # not re-parsed (the folder does not exist)
     saved = json.loads((cache_dir / "pdf_text_live.json").read_text(encoding="utf-8"))
     assert saved["ES01/may.pdf"] == "pago 2 de 3"
+
+
+def test_earlier_phase_pdf_only_touches_exact_older_items():
+    """A TRAIN PDF must not attach clauses (or 'replaces') to a look-alike LIVE number."""
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+    from test_bankrec_rules import make_book
+
+    book = make_book(
+        ("ARI-2025-0000001", "F-2025/0100", 10000, "2025-05-10"),  # carried over, exact
+        ("ARI-2025-0000002", "F-2025-100", 20000, "2025-08-01"),  # LIVE look-alike (noisy key)
+        ("ARI-2025-0000003", "F-2025/0100", 30000, "2025-09-01"),  # same number, issued later
+    )
+    eng = SimpleNamespace(book=book)
+    got = Engine._carried(eng, "F-2025/0100", "AR", {"ES01"}, "2025-05-31")
+    assert got == ["ARI-2025-0000001"]
+    assert Engine._carried(eng, "F-2025/0100", "AR", {"ES99"}, "2025-05-31") == []
+    assert Engine._carried(eng, "F-2025/0100", "AP", {"ES01"}, "2025-05-31") == []

@@ -121,12 +121,28 @@ class Engine:
             if dtype not in ("invoice", "supplier_invoice", "credit_note", "supplier_credit_note"):
                 continue
             side = "AR" if dtype in ("invoice", "credit_note") else "AP"
-            ids = self.book.find_number(r["document_number"], side=side, entities={r["entity"]})
+            ents = {r["entity"]}
+            # A PDF of an earlier phase (LIVE/FINAL context) only describes items carried over
+            # from that phase: exact number, issued no later than the PDF itself. The noisy-key
+            # fallback of find_number would otherwise attach its clauses to look-alike numbers of
+            # THIS phase (measured on LIVE: 1,849 items wrongly cancelled as "replaced").
+            prior = bool(r.get("_src"))
+            doc_date = str(r.get("document_date", ""))[:10]
+            ids = (
+                self._carried(r["document_number"], side, ents, doc_date)
+                if prior
+                else self.book.find_number(r["document_number"], side=side, entities=ents)
+            )
             if not ids:
                 continue
             new = ids[0]
             if c.replaces:
-                for old in self.book.find_number(c.replaces, side=side, entities={r["entity"]}):
+                olds = (
+                    self._carried(c.replaces, side, ents, doc_date)
+                    if prior
+                    else self.book.find_number(c.replaces, side=side, entities=ents)
+                )
+                for old in olds:
                     if old != new:
                         self.book.cancelled.add(old)
                         self.book.replaced_by[old] = new
@@ -142,6 +158,16 @@ class Engine:
                 for old in self.book.find_number(it.related, side=it.side, entities={it.entity}):
                     if old in self.book.cancelled:
                         self.book.cancelled.add(iid)
+
+    def _carried(self, number: str, side: str, entities: set[str], before: str) -> list[str]:
+        """Items with exactly this printed number (no noisy keys), issued on or before `before`."""
+        return [
+            i
+            for i in self.book.by_number.get(alnum(number), [])
+            if self.book.items[i].side == side
+            and self.book.items[i].entity in entities
+            and (not before or self.book.items[i].issue <= before)
+        ]
 
     def _bank_indexes(self) -> None:
         b = self.ph.bank
