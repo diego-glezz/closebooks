@@ -110,6 +110,8 @@ class Ctx:
     payer_country: str
     # learned from TRAIN before the window: currency -> shortfalls (cents) of intermediary fees
     fees: dict[str, list[int]] | None = None
+    # payer in the same country as the collecting entity: no intermediary bank is involved
+    domestic: bool = False
 
 
 def _days(d: str) -> date:
@@ -126,6 +128,9 @@ def discount_c(it: Item, terms: dict[str, tuple[float, int]], booking: str) -> t
     return disc, within
 
 
+_FX_REPLACES = ("", "SHORT_DISCOUNT", "SHORT_WITHHOLDING", "SHORT_BANK_CHARGES")
+
+
 def settle(
     book: Book,
     ids: list[str],
@@ -135,7 +140,31 @@ def settle(
     allow_partial: bool = True,
 ) -> list[Alloc] | None:
     """Split the cash of a bank line over a set of items following POLICIES §2-3.
-    Returns None if the cash cannot be explained by these items (caller tries something else)."""
+    Returns None if the cash cannot be explained by these items (caller tries something else).
+
+    POLICIES §3 FX_DIFFERENCE: when the bank line is in a different currency than the invoices,
+    every fully cleared invoice row carries FX_DIFFERENCE, replacing an empty exception,
+    SHORT_DISCOUNT, SHORT_WITHHOLDING or SHORT_BANK_CHARGES (PARTIAL / SHORT_DISPUTE keep their
+    code, credit-note rows stay empty)."""
+    res = _settle(book, ids, ctx, fx, terms, allow_partial)
+    if res and ids and book.items[ids[0]].ccy != ctx.ccy:
+        res = [
+            Alloc(a.item, a.amount_c, "FX_DIFFERENCE")
+            if a.exception in _FX_REPLACES and not book.items[a.item].is_credit
+            else a
+            for a in res
+        ]
+    return res
+
+
+def _settle(
+    book: Book,
+    ids: list[str],
+    ctx: Ctx,
+    fx: FX,
+    terms: dict[str, tuple[float, int]],
+    allow_partial: bool = True,
+) -> list[Alloc] | None:
     if not ids:
         return None
     items = [book.items[i] for i in ids]
@@ -208,7 +237,8 @@ def settle(
     hit = bool(known) and any(abs(diff - f) <= 2 for f in known)
     # a non-EUR fee from the learned schedule is specific enough (e.g. 11.85 USD) to need no
     # "international" hint; EUR fees (10, 15, 20...) are round and need it
-    if (ctx.international or (hit and iccy != "EUR")) and len(invoices) == 1 and not late_discount:
+    relaxed = hit and iccy != "EUR" and not ctx.domestic
+    if (ctx.international or relaxed) and len(invoices) == 1 and not late_discount:
         eur = fx.convert(diff, iccy, "EUR", ctx.booking) or diff
         biggest = invoices[0][1]
         on_schedule = not known or hit

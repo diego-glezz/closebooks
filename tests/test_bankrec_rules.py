@@ -147,6 +147,45 @@ def test_parse_csv_advice_semicolon_header():
     assert adv.ref == "REM/2025/0478" and len(adv.lines) == 1 and adv.lines[0].paid == 112027
 
 
+def test_parse_xlsx_advice_with_voucher_layout_from_september_2025():
+    # the key account puts ITS voucher first; our invoice number (no prefix) is in "Invoice"
+    adv = Advice(file="x.xlsx", entity="AU01", payer="P", received="")
+    _parse_csv_rows(
+        [
+            ["Pool & Spa Sol Pty Ltd", "", "", "", "", "", ""],
+            ["Payment advice", "2057001209", "2025-09-01", "", "", "", ""],
+            ["Voucher", "Invoice", "PO", "Inv. date", "Amount", "Deduction", "Net paid"],
+            ["VCHR65740934", "320871", "4517600404", "2024-09-13", "1044.09", "0", "1044.09"],
+            [
+                "VCHR24305374",
+                "310102",
+                "4573929383",
+                "2025-04-18",
+                "11793.4",
+                "-589.67",
+                "11203.73",
+            ],
+        ],
+        adv,
+    )
+    assert adv.ref == "2057001209"
+    assert [ln.number for ln in adv.lines] == ["320871", "310102"]
+    assert adv.lines[1].gross_c == 1179340 and adv.lines[1].deduction_c == -58967
+    assert adv.paid_total == 104409 + 1120373
+
+
+def test_deduction_without_reason_is_inferred_from_the_amount():
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    eng = SimpleNamespace(terms=TERMS)
+    inv = SimpleNamespace(terms="D2N30", total=100000)
+    assert Engine._deduction_by_amount(eng, inv, 2000) == "discount"  # 2 % of the total
+    assert Engine._deduction_by_amount(eng, inv, 1500) == "withholding"  # 1.5 %
+    assert Engine._deduction_by_amount(eng, inv, 5000) == "dispute"  # no rate explains it
+
+
 def test_parse_clauses():
     c = parse_clauses("Esta factura anula y sustituye a la factura FV24-0111238 de 13/06/2024.")
     assert c.replaces == "FV24-0111238"
@@ -246,6 +285,29 @@ def test_bank_charges_non_eur_fee_on_schedule_needs_no_international_hint():
     assert (
         settle(e, ["ARI-2025-0000002"], eur, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
     )
+
+
+def test_fx_line_replaces_short_discount_with_fx_difference():
+    # USD invoice paid into an EUR account with a 2 % early-payment discount: POLICIES §3 says
+    # the fully cleared row carries FX_DIFFERENCE instead of SHORT_DISCOUNT
+    b = make_book(("ARI-2025-0000001", "FV21-1", 100000, "2025-06-01", "D2N30", "USD"))
+    c = ctx(90000, orig_c=98000, orig_ccy="USD")
+    a = settle(b, ["ARI-2025-0000001"], c, FX_RATES, TERMS)
+    assert (a[0].amount_c, a[0].exception) == (100000, "FX_DIFFERENCE")
+    # same cash in the invoice currency stays SHORT_DISCOUNT
+    b2 = make_book(("ARI-2025-0000002", "FV21-2", 100000, "2025-06-01", "D2N30"))
+    a2 = settle(b2, ["ARI-2025-0000002"], ctx(98000), FX_RATES, TERMS)
+    assert a2[0].exception == "SHORT_DISCOUNT"
+
+
+def test_domestic_payer_never_pays_intermediary_bank_charges():
+    b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01", "T30", "USD"))
+    ids = ["ARI-2025-0000001"]
+    fees = {"USD": [1185]}
+    foreign = ctx(191944 - 1185, ccy="USD", fees=fees)
+    home = ctx(191944 - 1185, ccy="USD", fees=fees, domestic=True)
+    assert settle(b, ids, foreign, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+    assert settle(b, ids, home, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
 
 
 def test_partial_payment_keeps_cash_amount():

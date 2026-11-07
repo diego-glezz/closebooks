@@ -540,6 +540,7 @@ class Engine:
             own = self.entity_country.get(r["entity"], "")
             if ctx.payer_country and ctx.payer_country not in SEPA and ctx.payer_country != own:
                 ctx.international = True
+            ctx.domestic = bool(ctx.payer_country and ctx.payer_country == own)
         if RETURN_RX.search(ftext):
             res = self._reversal(r, ctx) if receipt else None
             res = res or self._returned(r, ctx, parties, receipt)
@@ -549,6 +550,9 @@ class Engine:
         if res:
             return self._finish(res)
         res = self._by_party(r, ctx, text, parties, receipt)
+        if res:
+            return self._finish(res)
+        res = self._by_homonym(r, ctx, scope, receipt)
         if res:
             return self._finish(res)
         guess = self.cats.fallback(r)
@@ -742,7 +746,13 @@ class Engine:
             it = self.book.items[iid]
             paid = abs(ln.paid)
             open_c = self.book.open[iid] or it.total
-            kind = deduction_kind(ln.reason) if ln.deduction_c else ""
+            kind = ""
+            if ln.deduction_c:
+                kind = (
+                    deduction_kind(ln.reason)
+                    if ln.reason.strip()
+                    else self._deduction_by_amount(it, abs(ln.deduction_c))
+                )
             if it.is_credit:
                 allocs.append(Alloc(iid, open_c, ""))
             elif kind == "discount":
@@ -1166,15 +1176,74 @@ class Engine:
                     return Result(r["bank_txn_id"], res, rule="party_short")
         return None
 
+    def _deduction_by_amount(self, it, deduction_c: int) -> str:
+        """Kind of a deduction whose advice gives no reason (the layout a key account switched to
+        in September 2025 has no reason column): an early-payment discount of the invoice terms,
+        a withholding at source (POLICIES §3 rates), or otherwise a dispute."""
+        pct, _days = self.terms.get(it.terms, (0.0, 0))
+        if pct and abs(deduction_c - round(it.total * pct / 100)) <= 1:
+            return "discount"
+        if any(abs(deduction_c - round(it.total * rate / 100)) <= 1 for rate in WITHHOLDING_RATES):
+            return "withholding"
+        return "dispute"
+
+    def _by_homonym(self, r: dict, ctx: Ctx, scope: set[str], receipt: bool) -> Result | None:
+        """The master has many customers with the same name (up to dozens), all tied on the name
+        score, and the tie is broken by id: the real payer can sit far beyond the top 8 that
+        _by_party looks at. Last resort before giving up: among ALL the tied customers, accept
+        the payment only when exactly one open invoice has this exact amount."""
+        blob = " ".join([r["text"], r["counterparty_name"], r["remittance_info"]])
+        joined = blob.replace(" | ", "") + " " + blob.replace("|", " ")
+        ranked = self.parties.by_name(joined, scope)
+        if len(ranked) < 2:
+            return None
+        tied = [p for p, s in ranked if s == ranked[0][1]]
+        side = "AR" if receipt else "AP"
+        kinds = self._sides(receipt)
+        found = [
+            i
+            for p in sorted(tied)
+            for i in self.book.open_items(p, ctx.booking)
+            if self.book.items[i].kind in kinds
+            and self.book.items[i].side == side
+            and not self.book.items[i].is_credit
+            and self.book.items[i].ccy == ctx.ccy
+            and abs(self.book.open[i] - ctx.cash_c) <= 1
+        ]
+        if len(found) != 1:
+            return None
+        res = settle(self.book, found, ctx, self.fx, self.terms, allow_partial=False)
+        if res and all(a.exception == "" for a in res):
+            return Result(r["bank_txn_id"], res, rule="party_amount_homonym")
+        return None
+
     # ================================================================ helpers
 
     def _targets(self, ctx: Ctx) -> list[tuple[int, int]]:
         """Cash to explain, plus the gross amount before withholding at source for payers in
         withholding countries (POLICIES §3: 1.25 / 1.5 / 10 % of the invoice total)."""
-        out = [(ctx.cash_c, 1)]
+        cash = self._line_cash(ctx)
+        out = [(cash, 1)]
         if ctx.payer_country in WITHHOLDING_COUNTRIES:
-            out += [(round(ctx.cash_c / (1 - rate / 100)), 25) for rate in WITHHOLDING_RATES]
+            out += [(round(cash / (1 - rate / 100)), 25) for rate in WITHHOLDING_RATES]
         return out
+
+    @staticmethod
+    def _fx_orig(ctx: Ctx) -> bool:
+        """Bank line in another currency than its account whose instructed amount (the invoice
+        currency amount, POLICIES §3) is known."""
+        return bool(ctx.orig_c and ctx.orig_ccy and ctx.orig_ccy != ctx.ccy)
+
+    def _line_cash(self, ctx: Ctx) -> int:
+        """Cash to explain, in the currency of the items it settles."""
+        return ctx.orig_c if self._fx_orig(ctx) else ctx.cash_c
+
+    def _in_line_ccy(self, ids: list[str], ctx: Ctx) -> list[str]:
+        """For an FX line with a known instructed amount only items in that currency can add up
+        to it; otherwise the pool is left as it is."""
+        if not self._fx_orig(ctx):
+            return ids
+        return [i for i in ids if self.book.items[i].ccy == ctx.orig_ccy]
 
     def _unique_subset_alloc(
         self,
@@ -1185,7 +1254,7 @@ class Engine:
         max_items: int = 5,
     ) -> list[Alloc] | None:
         lo = (_d(ctx.booking) - timedelta(days=recent_days)).isoformat()
-        pool = [i for i in open_ids if self.book.items[i].issue >= lo]
+        pool = [i for i in self._in_line_ccy(open_ids, ctx) if self.book.items[i].issue >= lo]
         pool = sorted(pool, key=lambda i: (self.book.items[i].issue, i), reverse=True)[:cap]
         if len(pool) < 2:
             return None
@@ -1220,12 +1289,15 @@ class Engine:
         FIFO prefixes (by due date and by issue date, with/without credit notes) first,
         then small subsets."""
         fam = self.parties.family(party)
-        pool = [
-            i
-            for q in sorted(fam)
-            for i in self.book.open_items(q, ctx.booking, side)
-            if i not in exclude
-        ]
+        pool = self._in_line_ccy(
+            [
+                i
+                for q in sorted(fam)
+                for i in self.book.open_items(q, ctx.booking, side)
+                if i not in exclude
+            ],
+            ctx,
+        )
         if not pool:
             return None
         invs = [i for i in pool if not self.book.items[i].is_credit]

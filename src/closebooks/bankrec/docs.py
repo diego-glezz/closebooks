@@ -97,11 +97,24 @@ def _parse_txt(text: str, adv: Advice) -> None:
 _NUM_HEADERS = ("document", "invoice", "doc", "factura", "rechnung", "facture", "documento")
 
 
+def _number_column(cells: list[str]) -> int | None:
+    """Column that holds OUR document number. It is the first column in the usual layouts, but
+    the layout a key account switched to in September 2025 starts with its own voucher number
+    ("Voucher, Invoice, PO, Inv. date, Amount, Deduction, Net paid"): our number, without
+    prefix, is in the "Invoice" column."""
+    low = [c.lower() for c in cells]
+    for name in _NUM_HEADERS:
+        if name in low:
+            return low.index(name)
+    return None
+
+
 def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
     rows = [[c.strip() for c in r] for r in rows if r and any(c.strip() for c in r)]
-    header_at = next((k for k, r in enumerate(rows) if r[0].lower() in _NUM_HEADERS), None)
+    header_at = next((k for k, r in enumerate(rows) if _number_column(r) is not None), None)
     if header_at is None:
         return
+    num_col = _number_column(rows[header_at]) or 0
     for r in rows[
         :header_at
     ]:  # metadata rows: "payment_ref;X;payment_date;Y" or "Payment advice;X;date"
@@ -117,7 +130,7 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
     header = [h.lower() for h in rows[header_at]]
     idx = {h: n for n, h in enumerate(header)}
     for r in rows[header_at + 1 :]:
-        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL"):
+        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL") or num_col >= len(r):
             continue
 
         def get(*names: str, r: list[str] = r) -> str:
@@ -127,13 +140,15 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
             return ""
 
         try:
-            ln = AdviceLine(number=r[0], gross_c=parse_amount(get("gross", "importe") or "0"))
+            ln = AdviceLine(
+                number=r[num_col], gross_c=parse_amount(get("gross", "importe", "amount") or "0")
+            )
             ded = get("discount_or_deduction", "deduction", "deduccion", "abzug")
             if ded and parse_amount(ded) != 0:
                 ln.deduction_c = -abs(parse_amount(ded))
             ln.reason = get("reason", "motivo", "grund")
-            if get("paid", "pagado", "bezahlt"):
-                ln.paid_c = parse_amount(get("paid", "pagado", "bezahlt"))
+            if get("paid", "pagado", "bezahlt", "net paid"):
+                ln.paid_c = parse_amount(get("paid", "pagado", "bezahlt", "net paid"))
         except ValueError:
             continue
         adv.lines.append(ln)
