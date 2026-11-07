@@ -127,11 +127,27 @@ class Engine:
         self.ref_why: dict[str, str] = {}  # trace_ref: txn -> why _by_reference gave up
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
+        self.cheque_idx: dict[str, dict] = {}
+        self.card_idx: dict[tuple[str, int], str] = {}
+        self._bank_indexes()  # essential: without it nothing can run
+        # the rest of the setup only adds context: a failure on unseen data (FINAL drift) must
+        # cost that context, not the whole submission
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
-        self._load_pdf_clauses()
-        self._cancel_by_reason()
+        self._safe("PDF clauses", self._load_pdf_clauses)
+        self._safe("cancelled credit notes", self._cancel_by_reason)
         step("enlazar remesas, tarjetas, cheques, payment runs y avisos")
-        self._link_details()
+        self._safe("detail files", self._link_details)
+
+    @staticmethod
+    def _safe(what: str, fn: Callable[[], None]) -> None:
+        try:
+            fn()
+        except Exception:
+            import sys
+            import traceback
+
+            print(f"ATENCIÓN: fallo en la preparación ({what}); se sigue sin ello", file=sys.stderr)
+            traceback.print_exc()
 
     # ================================================================ setup
 
@@ -345,7 +361,6 @@ class Engine:
         return False
 
     def _link_details(self) -> None:
-        self._bank_indexes()
         ph = self.ph
         # --- outgoing payment runs (AP)
         if not ph.runs.empty:
@@ -423,11 +438,9 @@ class Engine:
                 cands = self.amt_idx.get((g0["account_id"], total), [])
                 self._claim(cands, "card", g.to_dict("records"), g0["settlement_date"], 1, 5)
         # returns need to find what a cheque / a card payment paid
-        self.cheque_idx: dict[str, dict] = {}
         if not ph.cheques.empty:
             for row in ph.cheques.to_dict("records"):
                 self.cheque_idx[str(row["cheque_number"]).lstrip("0")] = row
-        self.card_idx: dict[tuple[str, int], str] = {}
         if not ph.cards.empty:
             for row in ph.cards.to_dict("records"):
                 key = (str(row["card"])[-4:], round(float(row["gross"]) * 100))

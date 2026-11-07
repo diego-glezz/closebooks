@@ -605,3 +605,36 @@ def test_aggregated_run_total_converts_foreign_documents_to_the_account_currency
         {"doc_c": -11000, "currency": "USD"},  # credit note netted
     ]
     assert _run_total_in(rows, "EUR", "2025-03-03", FX_RATES) == 50000 + 100000 - 10000
+
+
+def test_final_masters_are_united_with_the_previous_ones(tmp_path):
+    # masters_final (state at 2026-06-30) must not drop what masters/ knew: a customer that
+    # left, the old IBAN of one that changed bank (POLICIES §5.11: both accounts are valid)
+    from closebooks.bankrec.data import load_masters
+
+    files = {
+        "categories.csv": ("category,description,gl_account", ["BANK_FEES,x,1"]),
+        "fx_rates.csv": ("date,currency,units_per_eur,source", ["2025-12-31,USD,1.10,ECB"]),
+        "suppliers.csv": ("supplier_id,entity,name,iban", ["S1,ES01,Sup,ES00"]),
+        "bank_accounts.csv": ("account_id,entity,currency,iban", ["A1,ES01,EUR,ES11"]),
+        "entities.csv": ("entity,country,functional_currency", ["ES01,ES,EUR"]),
+        "payment_terms.csv": ("code,days,early_payment_discount_pct,discount_days", ["T30,30,0,0"]),
+    }
+    for folder, customers, extra in (
+        ("masters", ["C1,ES01,Old Name,ES99OLD", "C2,ES01,Gone,ES98"], None),
+        ("final/masters_final", ["C1,ES01,New Name,ES97NEW", "C3,ZA01,New,ZA01"], "ZA01,ZA,ZAR"),
+    ):
+        d = tmp_path / folder
+        d.mkdir(parents=True)
+        (d / "customers.csv").write_text(
+            "customer_id,entity,name,iban\n" + "\n".join(customers) + "\n", encoding="utf-8"
+        )
+        for name, (head, rows) in files.items():
+            rows = rows + ([extra] if name == "entities.csv" and extra else [])
+            (d / name).write_text(head + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    final = load_masters(tmp_path, "final")
+    cust = final.customers.set_index("customer_id")
+    assert sorted(cust.index) == ["C1", "C2", "C3"]  # nobody is lost, ZA01 is added
+    assert cust.loc["C1", "name"] == "New Name"  # the final version wins on the same key
+    assert sorted(final.entities["entity"]) == ["ES01", "ZA01"]
+    assert len(load_masters(tmp_path, "live").customers) == 2  # other phases: masters/ only

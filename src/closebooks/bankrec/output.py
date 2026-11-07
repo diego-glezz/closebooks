@@ -118,6 +118,10 @@ def validate(root: Path, phase: str, submission: Path) -> dict:
     folder = root / phase
     with open(root / "masters" / "categories.csv", encoding="utf-8") as fh:
         cats = [r["category"] for r in csv.DictReader(fh)]
+    final_cats = root / "final" / "masters_final" / "categories.csv"
+    if phase == "final" and final_cats.exists():  # FINAL may bring new categories
+        with open(final_cats, encoding="utf-8") as fh:
+            cats += [r["category"] for r in csv.DictReader(fh) if r["category"] not in cats]
     tmp_g = submission.parent / ".empty_golden.csv.gz"
     with gzip.open(tmp_g, "wt") as out:
         out.write("bank_txn_id,item_id,amount,category,exception\n")
