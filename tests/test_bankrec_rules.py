@@ -702,6 +702,7 @@ def test_advice_short_line_without_deduction_is_withholding_by_customer_country(
     country = {"C1": "BR"}
     parties = SimpleNamespace(by_name=lambda name, ents: [], family=lambda p: {p}, country=country)
     fake = SimpleNamespace(book=b, fx=FX_RATES, terms=TERMS, parties=parties)
+    fake._advice_owner = Engine._advice_owner.__get__(fake)
     adv = Advice(file="x.csv", entity="ES01", payer="P", received="")
     adv.lines = [
         AdviceLine("NF0125000001", 555935, 0, "", 555935 - 8339),  # 1.5 % withheld
@@ -825,3 +826,24 @@ def test_truncated_citation_is_completed_by_the_unique_due_subset():
     assert engine._due_complete(fake, "C1", ctx(0), cited, 41300, "AR") is None
     # nothing adds up: abstain
     assert engine._due_complete(fake, "C1", ctx(0), cited, 12345, "AR") is None
+
+
+def test_advice_owner_is_the_customer_that_owns_the_listed_documents():
+    # the payer name matches a homonym that owns NONE of the documents: the customer that owns
+    # most of them (number + printed amount) is the payer; no clear winner -> keep the name
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.docs import AdviceLine
+    from closebooks.bankrec.engine import Engine
+
+    b = make_book(
+        ("ARI-2025-0000001", "INV1", 1000, "2025-04-01"),
+        ("ARI-2025-0000002", "INV2", 2000, "2025-04-02"),
+    )
+    fake = SimpleNamespace(book=b)
+    adv = Advice(file="x.txt", entity="ES01", payer="Homonym", received="")
+    adv.lines = [AdviceLine("INV1", 1000), AdviceLine("INV2", 2000)]
+    assert Engine._advice_owner(fake, adv, "ES01", {"C9"}) == "C1"  # name match owns nothing
+    assert Engine._advice_owner(fake, adv, "ES01", {"C1"}) is None  # name match is right
+    adv.lines = [AdviceLine("INV1", 1000)]
+    assert Engine._advice_owner(fake, adv, "ES01", {"C9"}) is None  # one line is too little

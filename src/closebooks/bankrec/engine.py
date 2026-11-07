@@ -1040,6 +1040,36 @@ class Engine:
                     return iid
         return None
 
+    def _advice_owner(self, adv: Advice, ent: str, fam: set[str]) -> str | None:
+        """The customer whose documents the advice lists, when the payer NAME points elsewhere.
+        Names repeat in the customer master (homonyms tied on the name score, broken by id): if
+        none of the advice's documents belongs to the name match, the customer that owns most of
+        them (number + printed amount) is the payer. Only a clear winner with >= 2 lines."""
+        votes: Counter[str] = Counter()
+        lines = 0
+        for ln in adv.lines:
+            gross = abs(ln.gross_c)
+            tol = max(1, gross // 200)
+            owners = {
+                self.book.items[i].party
+                for i in self.book.find_number(ln.number, entities={ent})
+                if self.book.items[i].side == "AR"
+                and (
+                    abs(self.book.items[i].total - gross) <= tol
+                    or abs(self.book.open[i] - gross) <= tol
+                )
+            }
+            if owners:
+                lines += 1
+                votes.update(sorted(owners))
+        if not votes or any(p in fam for p in votes):
+            return None  # nothing to say, or the name match already owns documents
+        top = votes.most_common(2)
+        best, n = top[0]
+        if n >= max(2, (lines + 1) // 2) and (len(top) == 1 or top[1][1] < n):
+            return best
+        return None
+
     def _from_advice(self, r: dict, ctx: Ctx, adv: Advice) -> Result | None:
         ent = r["entity"]
         ps = self.parties.by_name(adv.payer, {ent})
@@ -1047,6 +1077,10 @@ class Engine:
         for p, _ in ps[:2]:
             fam |= self.parties.family(p)
         payer_country = self.parties.country.get(ps[0][0], "") if ps else ""
+        owner = self._advice_owner(adv, ent, fam)
+        if owner:
+            fam = self.parties.family(owner)
+            payer_country = self.parties.country.get(owner, "") or payer_country
         allocs: list[Alloc] = []
         for ln in adv.lines:
             ids = [
