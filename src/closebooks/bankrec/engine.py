@@ -315,8 +315,10 @@ class Engine:
                 due_by_number[(row["beneficiary_iban"], row["document_number"])] = self.book.items[
                     pick[0]
                 ].due
-        groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-        for _e2e, g in conf.groupby("end_to_end_id"):
+        # run ids and end-to-end ids REPEAT across entities (CH01 and PT01 both have run
+        # PR010025021381): every grouping is per debtor account, never by id alone
+        groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+        for (acct, _e2e), g in conf.groupby(["debtor_account_id", "end_to_end_id"]):
             dues = [
                 due_by_number.get((r["beneficiary_iban"], r["document_number"]), "")
                 for r in g.to_dict("records")
@@ -324,19 +326,19 @@ class Engine:
             dues = [d for d in dues if d]
             if not dues:
                 continue
-            groups[(g.iloc[0]["run_id"], next_business(max(dues)))] += g.to_dict("records")
-        for (run_id, maturity), rows in sorted(groups.items()):
+            groups[(acct, g.iloc[0]["run_id"], next_business(max(dues)))] += g.to_dict("records")
+        for (acct, run_id, maturity), rows in sorted(groups.items()):
             amount = -sum({r["end_to_end_id"]: int(r["xfer_c"]) for r in rows}.values())
             cands = [
                 i
                 for i in self.tok_idx.get(alnum(run_id), [])
-                if int(self.rows[i]["amount_c"]) == amount
+                if int(self.rows[i]["amount_c"]) == amount and self.rows[i]["account_id"] == acct
             ]
             self._claim(cands, "run", rows, maturity, 4, 4)
         # fallback: a debit citing the run ("REMESA CF... 8 PROVEEDORES") that no maturity group
         # explained (due dates not found, another maturity): the ONLY set of the run's
         # transfers (one per supplier) whose total is the debit
-        for run_id, g in conf.groupby("run_id"):
+        for (acct, run_id), g in conf.groupby(["debtor_account_id", "run_id"]):
             recs = g.to_dict("records")
             xfer: dict[str, int] = {}
             for x in recs:
@@ -349,7 +351,12 @@ class Engine:
             for i in self.tok_idx.get(alnum(run_id), []):
                 r = self.rows[i]
                 amt = -int(r["amount_c"])
-                if r["bank_txn_id"] in self.linked or amt <= 0 or r["booking_date"] < first_day:
+                if (
+                    r["bank_txn_id"] in self.linked
+                    or amt <= 0
+                    or r["booking_date"] < first_day
+                    or r["account_id"] != acct
+                ):
                     continue
                 if len(keys) > 30:
                     # big run: too many subsets, but a debit for ONE supplier ("1 PROVEEDORES")
@@ -398,9 +405,9 @@ class Engine:
                     runs["run_type"],
                     runs.apply(
                         lambda r: (
-                            r["end_to_end_id"]
+                            f"{r['debtor_account_id']}|{r['end_to_end_id']}"
                             if r["run_type"] == "transfers"
-                            else f"{r['run_id']}|{r['execution_date']}"
+                            else f"{r['debtor_account_id']}|{r['run_id']}|{r['execution_date']}"
                         ),
                         axis=1,
                     ),
@@ -414,16 +421,22 @@ class Engine:
                 payload = g.to_dict("records")
                 tok = alnum(g0["end_to_end_id"] if rtype == "transfers" else g0["run_id"])
                 cands = [
-                    i for i in self.tok_idx.get(tok, []) if int(self.rows[i]["amount_c"]) == amount
+                    i
+                    for i in self.tok_idx.get(tok, [])
+                    if int(self.rows[i]["amount_c"]) == amount
+                    and self.rows[i]["account_id"] == acct
                 ]
                 if not cands:
                     cands = self.amt_idx.get((acct, amount), [])
                     if rtype == "transfers":
+                        # N43 cuts the end-to-end id to 16 chars, in ref1 or in ref2
                         pref = [
                             i
                             for i in cands
-                            if alnum(self.rows[i]["ref1"])
-                            and tok.startswith(alnum(self.rows[i]["ref1"]))
+                            if any(
+                                alnum(self.rows[i][f]) and tok.startswith(alnum(self.rows[i][f]))
+                                for f in ("ref1", "ref2")
+                            )
                         ]
                         cands = pref or cands
                 if self._claim(cands, "run", payload, day, 2, 6) or rtype != "confirming":
@@ -529,8 +542,12 @@ class Engine:
         with the foreign documents converted at the reference rate of the execution day."""
         if runs.empty:
             return
-        key = runs["end_to_end_id"].where(
-            runs["run_type"] == "transfers", runs["run_id"] + "|" + runs["execution_date"]
+        key = (
+            runs["debtor_account_id"]
+            + "|"
+            + runs["end_to_end_id"].where(
+                runs["run_type"] == "transfers", runs["run_id"] + "|" + runs["execution_date"]
+            )
         )
         for (rtype, _k), g in runs.groupby([runs["run_type"], key]):
             g0 = g.iloc[0]
@@ -545,6 +562,7 @@ class Engine:
                     i
                     for i in self.tok_idx.get(alnum(g0["end_to_end_id"]), [])
                     if int(self.rows[i]["amount_c"]) < 0
+                    and self.rows[i]["account_id"] == acct
                     and abs(int(self.rows[i]["orig_amount_c"] or 0)) == xc
                     and self.rows[i]["orig_currency"] == ccy
                 ]
@@ -556,6 +574,7 @@ class Engine:
                     i
                     for i in self.tok_idx.get(alnum(g0["run_id"]), [])
                     if int(self.rows[i]["amount_c"]) < 0
+                    and self.rows[i]["account_id"] == acct
                     and abs(-int(self.rows[i]["amount_c"]) - expected) <= max(100, 0.003 * expected)
                 ]
                 if len(cands) == 1:
