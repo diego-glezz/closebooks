@@ -1305,13 +1305,15 @@ class Engine:
                     )
                     if res:
                         return Result(r["bank_txn_id"], res, rule="ref_subset")
-        res = self._ref_partial(r, ctx, text, open_inv)
+        res = self._ref_partial(r, ctx, text, open_inv, credits)
         if res:
             return res
         over = ctx.cash_c > sum(self._signed(i) for i in open_inv + credits) + 1
         return self._why(txn, "cash_above_cited_not_completed" if over else "settle_failed")
 
-    def _ref_partial(self, r: dict, ctx: Ctx, text: str, open_inv: list[str]) -> Result | None:
+    def _ref_partial(
+        self, r: dict, ctx: Ctx, text: str, open_inv: list[str], credits: list[str] | None = None
+    ) -> Result | None:
         """Last resort of the reference strategy: the cited invoices explain only part of the
         cash. POLICIES §3: one late-discounted invoice is PARTIAL for total - discount (the others
         full); otherwise the customer pays the invoices in the order it cites them and the
@@ -1319,6 +1321,22 @@ class Engine:
         for "newest invoice"). The remainder of an instalment plan (last instalment "k/k") or of
         a dispute ("SETTLEMENT") clears the item without exception."""
         txn = r["bank_txn_id"]
+        cited_cn = [c for c in dict.fromkeys(credits or []) if c not in open_inv]
+        if cited_cn and FLAGS.ref_partial_v2:
+            # credit notes the customer CITES are netted in full (POLICIES §2); the cash plus
+            # their amount is spread over the cited invoices in citation order
+            ids = open_inv + cited_cn
+            res = settle(
+                self.book,
+                ids,
+                ctx,
+                self.fx,
+                self.terms,
+                allow_partial=True,
+                order=self._cite_order(text, ids),
+            )
+            if res:
+                return Result(txn, res, rule="ref_partial_cn")
         base = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
         if not base:
             return None
