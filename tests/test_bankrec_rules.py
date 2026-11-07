@@ -102,6 +102,28 @@ def test_duplicate_payment_refund_category_depends_on_sign():
     assert duplicate_refund_category("TRANSF FERRETERIA GOMEZ FRA 1003", receipt=True) is None
 
 
+def test_intercompany_loan_is_intercompany_not_loan_repayment():
+    assert category_by_text("PRESTAMO INTRAGRUPO CUOTA") == "INTERCOMPANY"
+    assert category_by_text("CUOTA PRESTAMO HIPOTECARIO") == "LOAN_REPAYMENT"
+
+
+def test_sign_dependent_categories():
+    """POLICIES §4: proforma receipt -> advance; duplicate refund debit -> customer refund."""
+    pf = "SEPA-UEBERWEISUNG SVWZ+PROFORMA PF25-0123 RHEI9"
+    assert category_by_text(pf, receipt=True) == "CUSTOMER_ADVANCE"
+    assert category_by_text("ACH CREDIT X CCD RMR*IV*PF25-0123*PI*10.00", receipt=True) == (
+        "CUSTOMER_ADVANCE"
+    )
+    assert category_by_text(pf) is None  # without the sign nothing is decided
+    assert category_by_text(pf, receipt=False) is None  # a debit naming a proforma is not one
+    dup = "ACH DEBIT LAKE HARMON POOL VENDOR PMT HPNB REFUND DUPLICATE PAYMENT 123"
+    assert category_by_text(dup, receipt=False) == "CUSTOMER_REFUND"
+    assert category_by_text(dup, receipt=True) is None
+    assert category_by_text("SVWZ+ABONO PAGO DOBLE RHEI", receipt=True) == "SUPPLIER_REFUND"
+    # "REEMBOLSO <nº>" may settle a supplier credit note: never a category by text alone
+    assert category_by_text("SVWZ+REEMBOLSO FV-25-123 RHEI", receipt=True) is None
+
+
 # ---------------------------------------------------------------- documents
 
 
@@ -172,18 +194,6 @@ def test_parse_xlsx_advice_with_voucher_layout_from_september_2025():
     assert [ln.number for ln in adv.lines] == ["320871", "310102"]
     assert adv.lines[1].gross_c == 1179340 and adv.lines[1].deduction_c == -58967
     assert adv.paid_total == 104409 + 1120373
-
-
-def test_deduction_without_reason_is_inferred_from_the_amount():
-    from types import SimpleNamespace
-
-    from closebooks.bankrec.engine import Engine
-
-    eng = SimpleNamespace(terms=TERMS)
-    inv = SimpleNamespace(terms="D2N30", total=100000)
-    assert Engine._deduction_by_amount(eng, inv, 2000) == "discount"  # 2 % of the total
-    assert Engine._deduction_by_amount(eng, inv, 1500) == "withholding"  # 1.5 %
-    assert Engine._deduction_by_amount(eng, inv, 5000) == "dispute"  # no rate explains it
 
 
 def test_parse_clauses():
@@ -337,6 +347,71 @@ def test_deduction_kind():
     assert deduction_kind("PENAL. RETRASO") == "dispute"
 
 
+def test_parse_xlsx_advice_layout_of_2025_09():
+    """Voucher | Invoice | PO | Inv. date | Amount | Deduction | Net paid (no reason column)."""
+    adv = Advice(file="x.xlsx", entity="AU01", payer="P", received="")
+    _parse_csv_rows(
+        [
+            ["Pool & Spa Sol Pty Ltd", "", "", "", "", "", ""],
+            ["Payment advice", "2057001209", "2025-09-01", "", "", "", ""],
+            ["Voucher", "Invoice", "PO", "Inv. date", "Amount", "Deduction", "Net paid"],
+            ["VCHR65740934", "320871", "4517600404", "2024-09-13", "1044.09", "0", "1044.09"],
+            ["VCHR04037863", "306817", "4554233277", "2025-03-10", "4943.81", "-98.88", "4844.93"],
+        ],
+        adv,
+    )
+    assert adv.ref == "2057001209" and adv.pay_date == "2025-09-01"
+    assert [ln.number for ln in adv.lines] == ["320871", "306817"]  # the invoice, not the voucher
+    assert adv.lines[0].gross_c == 104409 and adv.lines[0].paid == 104409
+    assert adv.lines[1].deduction_c == -9888 and adv.lines[1].paid == 484493
+    assert adv.lines[1].reason == ""
+
+
+def test_parse_pdf_advice_deduction_and_reason_on_one_line():
+    from closebooks.bankrec.docs import _parse_pdf_text
+
+    adv = Advice(file="x.pdf", entity="DE01", payer="P", received="")
+    _parse_pdf_text(
+        "REMITTANCE ADVICE\nDocument\nDate\nGross\nDeduction\nPaid\n"
+        "RE250106321\n04/04/2025\n4,371.12\n4,371.12\n"
+        "RE250106102\n02/04/2025\n2,422.74\n-121.13 PENAL. RETRASO\n2,301.61\n"
+        "RE250106165\n03/04/2025\n2,708.15\n2,708.15\n",
+        adv,
+    )
+    assert [ln.number for ln in adv.lines] == ["RE250106321", "RE250106102", "RE250106165"]
+    ln = adv.lines[1]
+    assert (ln.gross_c, ln.deduction_c, ln.paid_c) == (242274, -12113, 230161)
+    assert ln.reason == "PENAL. RETRASO"
+    assert adv.lines[2].paid == 270815  # the table keeps being read after the deduction
+
+
+def test_deduction_without_reason_is_classified_by_amount():
+    from closebooks.bankrec.rules import deduction_kind_by_amount
+
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20", "D2N30"))
+    it = book.items["ARI-2025-0000001"]
+    assert deduction_kind_by_amount(it, -2000, TERMS, "ES") == "discount"  # 2 % of the total
+    assert deduction_kind_by_amount(it, -1500, TERMS, "ES") == "dispute"
+    assert deduction_kind_by_amount(it, -1500, TERMS, "MX") == "withholding"  # 1.5 %
+    assert deduction_kind_by_amount(it, -1500, TERMS, "BR") == "withholding"
+    plain = make_book(("ARI-2025-0000002", "FV25-2", 100000, "2025-05-20", "T30"))
+    assert (
+        deduction_kind_by_amount(plain.items["ARI-2025-0000002"], -2000, TERMS, "ES") == "dispute"
+    )
+
+
+def test_returned_never_reopens_more_than_the_document():
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20"))
+    iid = "ARI-2025-0000001"
+    # window that starts after the original payment: the item is still open for its total
+    book.apply("BT-RET", iid, 100000, "RETURNED")
+    assert book.open[iid] == 100000
+    book.apply("BT-PAY", iid, 100000, "")
+    assert book.open[iid] == 0
+    book.apply("BT-RET2", iid, 100000, "RETURNED")  # with history it does re-open the amount
+    assert book.open[iid] == 100000
+
+
 def test_pdf_payment_plans():
     c = parse_clauses(
         "Forma de pago: 3 vencimientos a 60/90/120 dias (642,98 / 642,98 / 642,99 EUR)."
@@ -379,3 +454,112 @@ def test_name_matching_uses_same_normalization_on_both_sides():
     sup = pd.DataFrame(columns=["supplier_id", "entity", "name", "country", "iban"])
     p = Parties(cust, sup, {})
     assert p.by_name("ACH CREDIT POOL & SPA KING E HIJOS CCD", {"US01"})[0][0] == "C1"
+
+
+# ---------------------------------------------------------------- role B: FIFO subset
+
+
+def test_subset_solutions_finds_every_subset_within_tolerance():
+    from closebooks.bankrec.rules import subset_solutions
+
+    values = [100, 250, 300, 50, 400]
+    assert sorted(subset_solutions(values, 450, tol=0)) == [[0, 2, 3], [3, 4]]
+    assert subset_solutions(values, 10_000) == []
+    assert subset_solutions([1] * 14, 7, tol=0, limit=10) is None  # 3432 solutions: too generic
+
+
+def test_fifo_pick_prefers_the_prefix_and_abstains_on_ties():
+    from closebooks.bankrec.rules import fifo_pick
+
+    # items are in FIFO order: [0, 1, 2] is a prefix (0 holes), [0, 2, 4] leaves 2 older unpaid
+    assert fifo_pick([[0, 2, 4], [0, 1, 2]], max_holes=2) == [0, 1, 2]
+    assert fifo_pick([[0, 2, 3], [0, 1, 3]], max_holes=2) is None  # 1 hole each: tie, abstain
+    assert fifo_pick([[0, 2, 3], [0, 1, 4]], max_holes=2) == [0, 2, 3]  # 1 hole beats 2
+    assert fifo_pick([[2, 5]], max_holes=2) is None  # 4 holes: too far from FIFO
+
+
+def test_flags_defaults():
+    from closebooks.bankrec.variants import Flags
+
+    f = Flags()
+    assert f.two_pass_party and f.ref_cn_subset and f.ref_po  # ON after measuring them
+    assert not any((f.ref_corroborate, f.ref_trust_other, f.complete_near, f.trace_ref))
+    assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
+    assert (f.exact_recent_days, f.stale_days) == (0, 0)
+    assert (f.subset_recent_days, f.subset_cap, f.subset_max_items) == (240, 22, 5)
+
+
+# ---------------------------------------------------------------- role-B switches
+
+
+def _fake_engine(book: Book):
+    from types import SimpleNamespace
+
+    from closebooks.bankrec.engine import Engine
+
+    fake = SimpleNamespace(book=book, fx=FX_RATES, terms=TERMS)
+    fake._signed = lambda i: Engine._signed(fake, i)
+    return Engine, fake
+
+
+def test_cited_invoices_paid_net_of_a_subset_of_credit_notes():
+    """ref_cn_subset: the shortfall is exactly ONE subset of the party's open credit notes."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-1", 100000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-2", 50000, "2025-04-03"),
+        ("ARC-2025-0000003", "AB25-1", 7000, "2025-04-05"),
+        ("ARC-2025-0000004", "AB25-2", 2500, "2025-04-06"),
+        ("ARC-2025-0000005", "AB25-3", 900, "2025-04-07"),
+    )
+    engine, fake = _fake_engine(b)
+    cns = ["ARC-2025-0000003", "ARC-2025-0000004", "ARC-2025-0000005"]
+    inv = ["ARI-2025-0000001", "ARI-2025-0000002"]
+    got = engine._net_of_credits(fake, inv, cns, ctx(150000 - 7000 - 900))
+    assert {(a.item, a.amount_c, a.exception) for a in got} == {
+        ("ARI-2025-0000001", 100000, ""),
+        ("ARI-2025-0000002", 50000, ""),
+        ("ARC-2025-0000003", 7000, ""),
+        ("ARC-2025-0000005", 900, ""),
+    }
+    # no subset of the credit notes explains the shortfall: leave it to ref_partial
+    assert engine._net_of_credits(fake, inv, cns, ctx(150000 - 1234)) is None
+    # cash above the cited invoices: not this rule
+    assert engine._net_of_credits(fake, inv, cns, ctx(150100)) is None
+
+
+def test_pdf_clauses_never_touch_invoices_issued_after_the_pdf(monkeypatch):
+    """pdf_dated: a 2024 PDF must not reach this year's invoice through the noisy keys."""
+    from closebooks.bankrec import engine as eng
+
+    b = make_book(("ARI-2025-0000001", "RE250104461", 1000, "2025-06-26"))
+    _, fake = _fake_engine(b)
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", False)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == [
+        "ARI-2025-0000001"
+    ]
+    monkeypatch.setattr(eng.FLAGS, "pdf_dated", True)
+    assert eng.Engine._pdf_items(fake, "RE240104461", "AR", "ES01", "2024-03-01") == []
+    assert eng.Engine._pdf_items(fake, "RE250104461", "AR", "ES01", "2025-07-02") == [
+        "ARI-2025-0000001"
+    ]
+
+
+def test_weak_citations_are_accepted_only_when_they_agree_on_one_party():
+    """ref_corroborate: two short suffixes of the same customer are no coincidence; one suffix of
+    each of two customers is."""
+    b = make_book(
+        ("ARI-2025-0000001", "FV25-0516064", 40000, "2025-04-01"),
+        ("ARI-2025-0000002", "FV25-0519411", 25000, "2025-04-03"),
+        ("ARI-2025-0000003", "FV25-0777777", 31000, "2025-04-05"),
+    )
+    b.items["ARI-2025-0000003"].party = "C2"
+    engine, fake = _fake_engine(b)
+    one, two, other = "ARI-2025-0000001", "ARI-2025-0000002", "ARI-2025-0000003"
+    # C1 has two cited documents, C2 only one: C1 is corroborated
+    assert engine._corroborated(fake, [one, two, other], set(), ctx(65000)) == [one, two]
+    # one weak suffix per customer and no amount agreement: nothing is corroborated
+    assert engine._corroborated(fake, [one, other], set(), ctx(99999)) == []
+    # a single weak suffix whose amount IS the cash is enough
+    assert engine._corroborated(fake, [one, other], set(), ctx(31000)) == [other]
+    # strong citations are not part of the vote
+    assert engine._corroborated(fake, [one, two], {one, two}, ctx(65000)) == []

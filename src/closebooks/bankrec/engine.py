@@ -36,12 +36,16 @@ from closebooks.bankrec.rules import (
     Ctx,
     category_by_text,
     deduction_kind,
+    deduction_kind_by_amount,
     discount_c,
     duplicate_refund_category,
+    fifo_pick,
     settle,
+    subset_solutions,
     unique_subset,
 )
 from closebooks.bankrec.text import alnum, fold, service_month, text_tokens
+from closebooks.bankrec.variants import FLAGS
 
 AP_FACTORY = {"ES00": {"ES00", "ES01", "ES02", "PT01"}}
 # unplanned payments on account are always one of these shares of the invoice total (TRAIN)
@@ -110,6 +114,7 @@ class Engine:
         self.cats = CategoryModel(category_model)
         self.linked: dict[str, tuple[str, object]] = {}
         self.by_txn: dict[str, list[tuple[str, int]]] = {}  # bank line -> [(item, cents)]
+        self.ref_why: dict[str, str] = {}  # trace_ref: txn -> why _by_reference gave up
         self.month_hint: dict[str, tuple[int, int]] = {}  # item -> (service year, month)
         self.plan: dict[str, list[int]] = {}  # item -> planned partial amounts (PDF)
         step(f"cláusulas de {len(ph.pdf_index):,} PDFs".replace(",", "."))
@@ -145,7 +150,7 @@ class Engine:
             ids = (
                 self._carried(r["document_number"], side, ents, doc_date)
                 if prior
-                else self.book.find_number(r["document_number"], side=side, entities=ents)
+                else self._pdf_items(r["document_number"], side, r["entity"], doc_date)
             )
             if not ids:
                 continue
@@ -154,7 +159,7 @@ class Engine:
                 olds = (
                     self._carried(c.replaces, side, ents, doc_date)
                     if prior
-                    else self.book.find_number(c.replaces, side=side, entities=ents)
+                    else self._pdf_items(c.replaces, side, r["entity"], doc_date)
                 )
                 for old in olds:
                     if old != new:
@@ -182,6 +187,23 @@ class Engine:
             and self.book.items[i].entity in entities
             and (not before or self.book.items[i].issue <= before)
         ]
+
+    def _pdf_items(self, number: str, side: str, entity: str, day: str = "") -> list[str]:
+        """Items a PDF talks about. A PDF prints the full number, so with `pdf_exact` the noisy
+        keys (no prefix, no year...) are not used: they let an old PDF ("RE24...") hit this year's
+        invoice with the same sequence ("RE25...") and cancel it or give it a foreign plan."""
+        if FLAGS.pdf_exact:
+            return [
+                i
+                for i in self.book.by_number.get(alnum(number), [])
+                if self.book.items[i].side == side and self.book.items[i].entity == entity
+            ]
+        ids = self.book.find_number(number, side=side, entities={entity})
+        if FLAGS.pdf_dated and day:
+            # a document cannot talk about an invoice issued after it (an old "RE24..." PDF
+            # hitting this year's "RE25..." through the noisy keys)
+            ids = [i for i in ids if self.book.items[i].issue[:10] <= day[:10]]
+        return ids
 
     def _bank_indexes(self) -> None:
         b = self.ph.bank
@@ -219,12 +241,22 @@ class Engine:
         due_by_number: dict[tuple[str, str], str] = {}
         for _, row in conf.drop_duplicates(["beneficiary_iban", "document_number"]).iterrows():
             sup = sorted(self.parties.by_iban.get(alnum(row["beneficiary_iban"]), set()))
-            ids = self.book.find_number(
-                row["document_number"], party=sup[0] if sup else None, side="AP"
-            )
-            if ids:
+            amt = abs(int(row["doc_c"]))
+            ids: list[str] = []
+            for p in sup or [None]:  # every supplier with that IBAN (IBANs can repeat)
+                ids += [
+                    i
+                    for i in self.book.find_number(row["document_number"], party=p, side="AP")
+                    if i not in ids
+                ]
+            # the maturity is set by the invoices of the transfer: a credit note (its due is its
+            # issue date) or an approximate number match must not move it
+            invoices = [i for i in ids if not self.book.items[i].is_credit]
+            exact = [i for i in invoices if abs(self.book.items[i].total - amt) <= 1]
+            pick = exact or invoices[:1]
+            if pick:
                 due_by_number[(row["beneficiary_iban"], row["document_number"])] = self.book.items[
-                    ids[0]
+                    pick[0]
                 ].due
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for _e2e, g in conf.groupby("end_to_end_id"):
@@ -449,10 +481,47 @@ class Engine:
                 ]
         # N43 splits the text in 38-char fields: a name can be cut across " | "
         joined = blob.replace(" | ", "") + " " + blob.replace("|", " ")
-        for pid, _n in self.parties.by_name(joined, scope)[:8]:
+        named = self.parties.by_name(joined, scope, min_len=FLAGS.name_min_len)[:8]
+        if FLAGS.name_fuzzy and not named and not out:
+            named = self.parties.fuzzy_names(joined, scope)[:3]
+        for pid, _n in named:
             if pid not in out:
                 out.append(pid)
         return out
+
+    def _cp_ibans(self, r: dict) -> list[str]:
+        """Accounts printed on the line: camt counterparty, or IBAN-looking words in the text."""
+        out: list[str] = []
+        cp = alnum(r["counterparty_account"])
+        if cp:
+            out.append(cp)
+        blob = fold(" ".join([r["text"], r["remittance_info"]]))
+        for tok in blob.replace("|", " ").split():
+            a = alnum(tok)
+            if len(a) >= 20 and a[:2].isalpha() and a[2:4].isdigit() and a not in out:
+                out.append(a)
+        return out
+
+    def _learn_payer(self, r: dict, res: Result, parties: list[str]) -> None:
+        """A receipt settled by a cited document teaches us the payer's account (iban_learn)."""
+        if (
+            r["amount_c"] <= 0
+            or not res.allocs
+            or res.rule
+            not in (
+                "ref_set",
+                "ref_completed",
+                "ref_subset",
+            )
+        ):
+            return
+        owners = {self.book.items[a.item].party for a in res.allocs}
+        if len(owners) != 1:
+            return
+        owner = next(iter(owners))
+        for iban in self._cp_ibans(r):
+            if iban not in self.own_ibans:
+                self.parties.learn_iban(iban, owner)
 
     def _sides(self, receipt: bool) -> tuple[str, ...]:
         # receipts settle AR invoices (or AP credit notes refunded); payments the opposite
@@ -524,7 +593,7 @@ class Engine:
         if learned:
             exc = "UNIDENTIFIED" if learned == "UNIDENTIFIED" else ""
             return Result(txn, category=learned, exception=exc, rule="category_learned")
-        cat = category_by_text(text)
+        cat = category_by_text(text, receipt)
         if cat and cat != "BANK_FEES" and not RETURN_RX.search(ftext):
             return Result(txn, category=cat, rule="category_text")
         if cat == "BANK_FEES" and (
@@ -547,8 +616,18 @@ class Engine:
             if res:
                 return self._finish(res)
         res = self._by_reference(r, ctx, text, parties, scope, receipt)
+        if res and getattr(self, "_ref_other", False):
+            res.rule += "_other"  # own rule tag: precision measurable in explain.csv.gz
+        if not res and FLAGS.ref_fuzzy and parties:
+            res = self._by_fuzzy_reference(r, ctx, text, parties, scope, receipt)
         if res:
+            if FLAGS.iban_learn:
+                self._learn_payer(r, res, parties)
             return self._finish(res)
+        if FLAGS.two_pass_party:
+            res = self._by_party(r, ctx, text, parties, receipt, strong_only=True)
+            if res:
+                return self._finish(res)
         res = self._by_party(r, ctx, text, parties, receipt)
         if res:
             return self._finish(res)
@@ -708,7 +787,18 @@ class Engine:
                 return ids[0]
         if not party and name:
             ps = self.parties.by_name(name, {ent})
-            party = ps[0][0] if ps else None
+            tied = [p for p, score in ps if score == ps[0][1]] if ps else []
+            if len(tied) > 1:
+                # several customers match the name equally well: take the document only if
+                # exactly one of them has an open item for exactly this amount
+                hits = [
+                    iid
+                    for p in tied
+                    for iid in self.book.open_items(p, booking, side)
+                    if abs(self.book.open[iid] - amt) <= 1
+                ]
+                return hits[0] if len(hits) == 1 else None
+            party = tied[0] if tied else None
         if party:
             for iid in self.book.open_items(party, booking, side):
                 if abs(self.book.open[iid] - amt) <= 1:
@@ -721,6 +811,7 @@ class Engine:
         fam: set[str] = set()
         for p, _ in ps[:2]:
             fam |= self.parties.family(p)
+        payer_country = self.parties.country.get(ps[0][0], "") if ps else ""
         allocs: list[Alloc] = []
         for ln in adv.lines:
             ids = [
@@ -751,7 +842,7 @@ class Engine:
                 kind = (
                     deduction_kind(ln.reason)
                     if ln.reason.strip()
-                    else self._deduction_by_amount(it, abs(ln.deduction_c))
+                    else deduction_kind_by_amount(it, ln.deduction_c, self.terms, payer_country)
                 )
             if it.is_credit:
                 allocs.append(Alloc(iid, open_c, ""))
@@ -876,40 +967,67 @@ class Engine:
     ) -> Result | None:
         kinds = self._sides(receipt)
         fam: set[str] = set()
-        for p in parties[:3]:
+        for p in parties[: FLAGS.fam_parties]:
             fam |= self.parties.family(p)
+        txn = r["bank_txn_id"]
+        self._ref_other = False  # reset per line: set only when ref_trust_other decides
         cands: dict[str, None] = {}
         strong: set[str] = set()
         for tok in sorted(text_tokens(text)):
-            for iid in self.book.lookup(tok):
+            hits = [(iid, False) for iid in self.book.lookup(tok)]
+            if FLAGS.ref_po:  # the customer's own order number (indexed as "PO:<key>")
+                hits += [(iid, True) for iid in self.book.lookup("PO:" + tok)]
+            for iid, by_po in hits:
                 it = self.book.items[iid]
                 if it.kind in kinds and it.entity in scope and it.issue <= ctx.booking:
                     key = self.book.replaced_by.get(iid, iid)
                     cands[key] = None
-                    # full printed number (or 8+ digits of it) vs a short suffix like '415289'
-                    if len(tok) >= 8 or tok == alnum(it.number):
+                    # full printed number (or 8+ digits of it) vs a short suffix like '415289';
+                    # a PO is only strong when the whole PO is cited
+                    if (
+                        (tok == alnum(it.po))
+                        if by_po
+                        else (len(tok) >= 8 or tok == alnum(it.number))
+                    ):
                         strong.add(key)
         if not cands:
-            return None
+            return self._why(txn, "no_candidates")
         ids = [i for i in cands if i not in self.book.cancelled]
+        agreed = self._corroborated(ids, strong, ctx) if FLAGS.ref_corroborate else []
         if not fam:  # unknown payer: a short suffix alone is too weak unless the amount matches
-            ids = [i for i in ids if i in strong or abs(self.book.open[i] - ctx.cash_c) <= 1]
+            ids = [
+                i
+                for i in ids
+                if i in strong or i in agreed or abs(self.book.open[i] - ctx.cash_c) <= 1
+            ]
+            if not ids:
+                return self._why(txn, "weak_refs_unknown_payer")
         if fam:
             own = [i for i in ids if self.book.items[i].party in fam]
-            if not own and len(parties) > 3:
+            if not own and len(parties) > FLAGS.fam_parties:
                 # homonyms tie on the name score and the id decides: a FULL printed number that
                 # belongs to one of the other name matches identifies the payer
                 ext: set[str] = set()
-                for p in parties[3:8]:
+                for p in parties[FLAGS.fam_parties : 8]:
                     ext |= self.parties.family(p)
                 own = [i for i in ids if i in strong and self.book.items[i].party in ext]
                 if own:
                     fam |= ext
             # payer known but the reference points to someone else: only trust it when the
-            # amount matches exactly (agencies / confirming banks quote the debtor's invoice)
-            ids = own or [i for i in ids if abs(self.book.open[i] - ctx.cash_c) <= 1]
+            # amount matches exactly (agencies / confirming banks quote the debtor's invoice),
+            # or (ref_corroborate) when several cited documents agree on that other party
+            pre = ids
+            ids = own or [i for i in ids if abs(self.book.open[i] - ctx.cash_c) <= 1] or agreed
+            if not ids and FLAGS.ref_trust_other:
+                # POLICIES §5.1: who pays is not always the customer (parent, agency, confirming,
+                # renamed customer). Full printed numbers that all belong to ONE other party are
+                # stronger evidence than a name match.
+                full = [i for i in pre if i in strong]
+                if full and len({self.book.items[i].party for i in full}) == 1:
+                    ids = full
+                    self._ref_other = True
             if not ids:
-                return None
+                return self._why(txn, "refs_of_another_party")
         # main side first: receipts settle ARI, payments API
         main = "ARI" if receipt else "API"
         inv = [i for i in ids if self.book.items[i].kind == main]
@@ -925,7 +1043,7 @@ class Engine:
             if cn:
                 amt = self.book.open[cn[0]] or self.book.items[cn[0]].total
                 return Result(r["bank_txn_id"], [Alloc(cn[0], amt, "")], rule="ref_refund")
-            return None
+            return self._why(txn, "no_invoice_on_main_side")
         if len({self.book.items[i].party for i in inv}) > 1 and not fam:
             # ambiguous party: keep the ones whose amounts can explain the cash
             exact = [i for i in inv if abs(self.book.open[i] - ctx.cash_c) <= 1]
@@ -947,7 +1065,7 @@ class Engine:
                     [Alloc(closed[0], ctx.cash_c, "DUPLICATE_PAYMENT")],
                     rule="ref_duplicate",
                 )
-            return None
+            return self._why(txn, "cited_already_closed")
         # try: cited invoices; cited + party credit notes; subsets of cited invoices
         party = self.book.items[open_inv[0]].party
         credits = [i for i in ids if self.book.items[i].is_credit and self.book.open[i] > 0]
@@ -964,6 +1082,12 @@ class Engine:
                 continue
             if res:
                 return Result(r["bank_txn_id"], res, rule="ref_set")
+        if FLAGS.ref_cn_subset:
+            # cited invoices paid net of SOME of the party's open credit notes (POLICIES: credit
+            # notes are netted): the shortfall must be the unique subset of those credit notes
+            res = self._net_of_credits(open_inv + credits, party_credits, ctx)
+            if res:
+                return Result(r["bank_txn_id"], res, rule="ref_set_cn")
         # cash exceeds the cited invoices: the text was truncated, complete with the party's
         # other open items (oldest first, or a small subset)
         cited = sum(self._signed(i) for i in open_inv + credits)
@@ -998,17 +1122,95 @@ class Engine:
                     if res:
                         return Result(r["bank_txn_id"], res, rule="ref_subset")
         res = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
-        return Result(r["bank_txn_id"], res, rule="ref_partial") if res else None
+        if res:
+            return Result(r["bank_txn_id"], res, rule="ref_partial")
+        over = ctx.cash_c > sum(self._signed(i) for i in open_inv + credits) + 1
+        return self._why(txn, "cash_above_cited_not_completed" if over else "settle_failed")
+
+    def _why(self, txn: str, reason: str) -> None:
+        """trace_ref: remember why the reference strategy gave up on this line."""
+        if FLAGS.trace_ref:
+            self.ref_why[txn] = reason
+        return None
+
+    def _corroborated(self, ids: list[str], strong: set[str], ctx: Ctx) -> list[str]:
+        """Weak citations (short suffixes) that agree with each other: the ONLY party with two
+        or more cited documents, or whose cited documents add up to the cash. One noisy suffix
+        can hit any customer; several hitting the same one is no coincidence."""
+        by_party: dict[str, list[str]] = defaultdict(list)
+        for i in ids:
+            if i not in strong:
+                by_party[self.book.items[i].party].append(i)
+        good = [
+            p
+            for p in sorted(by_party)
+            if len(by_party[p]) >= 2
+            or abs(sum(self._signed(i) for i in by_party[p]) - ctx.cash_c) <= 1
+        ]
+        return by_party[good[0]] if len(good) == 1 else []
+
+    def _by_fuzzy_reference(
+        self, r: dict, ctx: Ctx, text: str, parties: list[str], scope: set[str], receipt: bool
+    ) -> Result | None:
+        """A cited number that matches nothing, but is one wrong / transposed digit away from
+        exactly one open invoice of the known payer whose amount explains the cash
+        (POLICIES §5.5: typos and transposed digits)."""
+        fam: set[str] = set()
+        for p in parties[: FLAGS.fam_parties]:
+            fam |= self.parties.family(p)
+        kinds = self._sides(receipt)
+        main = "ARI" if receipt else "API"
+        found: dict[str, None] = {}
+        for tok in sorted(text_tokens(text)):
+            if not tok.isdigit() or not 6 <= len(tok) <= 10 or self.book.lookup(tok):
+                continue
+            for k in self._digit_neighbours(tok):
+                for iid in self.book.lookup(k):
+                    it = self.book.items[iid]
+                    if (
+                        it.kind == main
+                        and it.kind in kinds
+                        and it.entity in scope
+                        and it.party in fam
+                        and it.issue <= ctx.booking
+                        and self.book.open[iid] > 0
+                        and iid not in self.book.cancelled
+                    ):
+                        found[iid] = None
+        if len(found) != 1:
+            return None
+        iid = next(iter(found))
+        res = settle(self.book, [iid], ctx, self.fx, self.terms, allow_partial=False)
+        if not res:
+            return None
+        return Result(r["bank_txn_id"], res, rule="ref_fuzzy")
+
+    @staticmethod
+    def _digit_neighbours(tok: str) -> list[str]:
+        out: dict[str, None] = {}
+        for i, ch in enumerate(tok):
+            for d in "0123456789":
+                if d != ch:
+                    out[tok[:i] + d + tok[i + 1 :]] = None
+            if i + 1 < len(tok) and tok[i] != tok[i + 1]:
+                out[tok[:i] + tok[i + 1] + tok[i] + tok[i + 2 :]] = None
+        return list(out)
 
     def _by_party(
-        self, r: dict, ctx: Ctx, text: str, parties: list[str], receipt: bool
+        self,
+        r: dict,
+        ctx: Ctx,
+        text: str,
+        parties: list[str],
+        receipt: bool,
+        strong_only: bool = False,
     ) -> Result | None:
         if not parties:
             return None
         side = "AR" if receipt else "AP"
         kinds = self._sides(receipt)
         month = service_month(text)
-        for rank, p in enumerate(parties[:8]):
+        for rank, p in enumerate(parties[: FLAGS.party_rank_exact]):
             fam = self.parties.family(p)
             open_ids: list[str] = []
             for q in sorted(fam):
@@ -1022,7 +1224,7 @@ class Engine:
             if not any(self.book.items[i].side == side for i in open_ids):
                 # only credit notes of the other side: a refund of exactly one of them
                 cn = [i for i in open_ids if abs(self.book.open[i] - ctx.cash_c) <= 1]
-                if cn:
+                if cn and not strong_only:
                     return Result(
                         r["bank_txn_id"],
                         [Alloc(cn[0], self.book.open[cn[0]], "")],
@@ -1039,6 +1241,11 @@ class Engine:
                 if (res := settle(self.book, [i], ctx, self.fx, self.terms, allow_partial=False))
                 and all(a.exception in ("", "FX_DIFFERENCE") for a in res)
             ]
+            if exact and FLAGS.exact_recent_days and len(exact) > 1:
+                # same amount, several open: invoices open for ages are dead, the payer
+                # settles a recent one (TRAIN: the golden one is never older than ~160 days)
+                lo = (_d(ctx.booking) - timedelta(days=FLAGS.exact_recent_days)).isoformat()
+                exact = [i for i in exact if self.book.items[i].issue >= lo] or exact
             if exact:
                 pick = exact[0]
                 if month and len(exact) > 1:
@@ -1092,6 +1299,8 @@ class Engine:
                         [Alloc(i, ctx.cash_c, "PARTIAL" if rest > 1 else "")],
                         rule="party_plan",
                     )
+            if strong_only:
+                continue
             # (b3) payment on account without reference: a round share (25-70 %, pattern measured
             # on TRAIN) of ONE untouched invoice of the likeliest payer; PARTIAL with the cash
             if rank == 0:
@@ -1122,13 +1331,17 @@ class Engine:
                     res = settle(self.book, extra, ctx, self.fx, self.terms, allow_partial=False)
                     if res:
                         return Result(r["bank_txn_id"], res, rule="party_fifo")
-            if rank >= 4:
+            if rank >= FLAGS.party_rank_comb:
                 continue  # combinatorial searches only for the most likely payers
             # (d) a payment of several invoices without reference: the UNIQUE subset of the
             # payer's recent open items (credit notes included) that adds up to the cash
             res = self._unique_subset_alloc(open_ids, ctx)
             if res:
                 return Result(r["bank_txn_id"], res, rule="party_subset")
+            if FLAGS.fifo_subset:
+                res = self._fifo_subset_alloc(open_ids, ctx)
+                if res:
+                    return Result(r["bank_txn_id"], res, rule="party_fifo_subset")
             if rank > 0:
                 continue  # a short payment is only credible from the most likely payer
             # (e0) nothing open matches but we already collected/paid one of the party's documents
@@ -1175,17 +1388,6 @@ class Engine:
                 ):
                     return Result(r["bank_txn_id"], res, rule="party_short")
         return None
-
-    def _deduction_by_amount(self, it, deduction_c: int) -> str:
-        """Kind of a deduction whose advice gives no reason (the layout a key account switched to
-        in September 2025 has no reason column): an early-payment discount of the invoice terms,
-        a withholding at source (POLICIES §3 rates), or otherwise a dispute."""
-        pct, _days = self.terms.get(it.terms, (0.0, 0))
-        if pct and abs(deduction_c - round(it.total * pct / 100)) <= 1:
-            return "discount"
-        if any(abs(deduction_c - round(it.total * rate / 100)) <= 1 for rate in WITHHOLDING_RATES):
-            return "withholding"
-        return "dispute"
 
     def _by_homonym(self, r: dict, ctx: Ctx, scope: set[str], receipt: bool) -> Result | None:
         """The master has many customers with the same name (up to dozens), all tied on the name
@@ -1249,10 +1451,13 @@ class Engine:
         self,
         open_ids: list[str],
         ctx: Ctx,
-        recent_days: int = 240,
-        cap: int = 22,
-        max_items: int = 5,
+        recent_days: int | None = None,
+        cap: int | None = None,
+        max_items: int | None = None,
     ) -> list[Alloc] | None:
+        recent_days = FLAGS.subset_recent_days if recent_days is None else recent_days
+        cap = FLAGS.subset_cap if cap is None else cap
+        max_items = FLAGS.subset_max_items if max_items is None else max_items
         lo = (_d(ctx.booking) - timedelta(days=recent_days)).isoformat()
         pool = [i for i in self._in_line_ccy(open_ids, ctx) if self.book.items[i].issue >= lo]
         pool = sorted(pool, key=lambda i: (self.book.items[i].issue, i), reverse=True)[:cap]
@@ -1270,6 +1475,60 @@ class Engine:
                 if res:
                     return res
         return None
+
+    def _fifo_subset_alloc(self, open_ids: list[str], ctx: Ctx) -> list[Alloc] | None:
+        """A payment of many invoices without reference (POLICIES §5.6: customers pay the oldest
+        open invoices first). Pool = the payer's oldest open items; of all subsets adding up to
+        the cash, the one closest to a FIFO prefix wins if it is unique."""
+        pool = [i for i in open_ids if self.book.items[i].ccy == ctx.ccy]
+        if FLAGS.stale_days:
+            lo = (_d(ctx.booking) - timedelta(days=FLAGS.stale_days)).isoformat()
+            pool = [i for i in pool if self.book.items[i].issue >= lo]
+        pool = sorted(pool, key=lambda i: (self.book.items[i].issue, self.book.items[i].number, i))
+        pool = pool[: FLAGS.fs_cap]
+        if len(pool) < 2:
+            return None
+        values = [self._signed(i) for i in pool]
+        for target, tol in self._targets(ctx):
+            sols = subset_solutions(values, target, tol)
+            if not sols:
+                continue
+            sols = [
+                s
+                for s in sols
+                if len(s) >= 2 and any(not self.book.items[pool[k]].is_credit for k in s)
+            ]
+            pick = fifo_pick(sols, FLAGS.fs_max_holes) if sols else None
+            if pick:
+                res = settle(
+                    self.book,
+                    [pool[k] for k in pick],
+                    ctx,
+                    self.fx,
+                    self.terms,
+                    allow_partial=False,
+                )
+                if res:
+                    return res
+        return None
+
+    def _net_of_credits(
+        self, cited: list[str], credits: list[str], ctx: Ctx, cap: int = 16
+    ) -> list[Alloc] | None:
+        cited = list(dict.fromkeys(cited))
+        pool = [i for i in credits if i not in cited]
+        pool = sorted(pool, key=lambda i: (self.book.items[i].issue, i), reverse=True)[:cap]
+        if not pool or any(self.book.items[i].ccy != ctx.ccy for i in cited + pool):
+            return None
+        short = sum(self._signed(i) for i in cited) - ctx.cash_c
+        if short <= 1:
+            return None
+        idx = unique_subset([self.book.open[i] for i in pool], short, 1)
+        if not idx:
+            return None
+        return settle(
+            self.book, cited + [pool[k] for k in idx], ctx, self.fx, self.terms, allow_partial=False
+        )
 
     def _signed(self, iid: str) -> int:
         o = self.book.open[iid]
@@ -1298,6 +1557,9 @@ class Engine:
             ],
             ctx,
         )
+        if FLAGS.stale_days:  # invoices open for ages are dead: nobody pays them any more
+            lo = (_d(ctx.booking) - timedelta(days=FLAGS.stale_days)).isoformat()
+            pool = [i for i in pool if self.book.items[i].issue >= lo]
         if not pool:
             return None
         invs = [i for i in pool if not self.book.items[i].is_credit]
@@ -1320,6 +1582,15 @@ class Engine:
                     break
         if subsets:
             small = sorted(pool, key=lambda i: (self.book.items[i].issue,))[:25]
+            if FLAGS.complete_near and exclude:
+                # the uncited rest of a truncated citation is rarely the payer's oldest items:
+                # look at the open items closest in issue date to the cited ones
+                cited = sorted(_d(self.book.items[i].issue) for i in exclude)
+                anchor = cited[len(cited) // 2]
+                small = sorted(
+                    pool,
+                    key=lambda i: (abs((_d(self.book.items[i].issue) - anchor).days), i),
+                )[:25]
             for k in (1, 2, 3):
                 for sub in itertools.combinations(small, k):
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:

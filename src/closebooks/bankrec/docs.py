@@ -71,6 +71,7 @@ class Advice:
 _LINE_RE = re.compile(
     rf"^\s*([A-Z]{{0,4}}[\w/\-\.]*\d[\w/\-\.]*)\s+({_DATE})\s+({_AMT})(?:\s+({_AMT}))?\s*(.*)$"
 )
+_AMT_REASON_RE = re.compile(rf"^({_AMT})\s+([^\d\s].*)$")
 _REF_RE = re.compile(r"^Subject:.*?([A-Z0-9][A-Z0-9/\-]*\d[A-Z0-9/\-]*)\s*$", re.I | re.M)
 _TOTAL_RE = re.compile(rf"({_AMT})\s*(EUR|USD|GBP|CHF|PLN|MXN|BRL|MAD|CNY|AUD|CAD|ZAR)")
 
@@ -97,24 +98,15 @@ def _parse_txt(text: str, adv: Advice) -> None:
 _NUM_HEADERS = ("document", "invoice", "doc", "factura", "rechnung", "facture", "documento")
 
 
-def _number_column(cells: list[str]) -> int | None:
-    """Column that holds OUR document number. It is the first column in the usual layouts, but
-    the layout a key account switched to in September 2025 starts with its own voucher number
-    ("Voucher, Invoice, PO, Inv. date, Amount, Deduction, Net paid"): our number, without
-    prefix, is in the "Invoice" column."""
-    low = [c.lower() for c in cells]
-    for name in _NUM_HEADERS:
-        if name in low:
-            return low.index(name)
-    return None
-
-
 def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
     rows = [[c.strip() for c in r] for r in rows if r and any(c.strip() for c in r)]
-    header_at = next((k for k, r in enumerate(rows) if _number_column(r) is not None), None)
+    # the header row is the first one naming a document-number column; the column can be
+    # anywhere (the layout of one big customer changed in 2025-09: Voucher | Invoice | PO | ...)
+    header_at = next(
+        (k for k, r in enumerate(rows) if any(c.lower() in _NUM_HEADERS for c in r)), None
+    )
     if header_at is None:
         return
-    num_col = _number_column(rows[header_at]) or 0
     for r in rows[
         :header_at
     ]:  # metadata rows: "payment_ref;X;payment_date;Y" or "Payment advice;X;date"
@@ -129,8 +121,9 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
             adv.pay_date = r[2] if len(r) > 2 else adv.pay_date
     header = [h.lower() for h in rows[header_at]]
     idx = {h: n for n, h in enumerate(header)}
+    num_col = next(n for n, h in enumerate(header) if h in _NUM_HEADERS)
     for r in rows[header_at + 1 :]:
-        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL") or num_col >= len(r):
+        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL") or len(r) <= num_col:
             continue
 
         def get(*names: str, r: list[str] = r) -> str:
@@ -147,8 +140,9 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
             if ded and parse_amount(ded) != 0:
                 ln.deduction_c = -abs(parse_amount(ded))
             ln.reason = get("reason", "motivo", "grund")
-            if get("paid", "pagado", "bezahlt", "net paid"):
-                ln.paid_c = parse_amount(get("paid", "pagado", "bezahlt", "net paid"))
+            paid = get("paid", "net paid", "net_paid", "pagado", "bezahlt")
+            if paid:
+                ln.paid_c = parse_amount(paid)
         except ValueError:
             continue
         adv.lines.append(ln)
@@ -175,13 +169,23 @@ def _parse_pdf_text(text: str, adv: Advice) -> None:
             and re.match(_DATE, lines[i + 1])
         ):
             vals = []
-            j = i + 2
-            while j < len(lines) and re.fullmatch(_AMT, lines[j]):
-                vals.append(parse_amount(lines[j]))
-                j += 1
             reason = ""
+            j = i + 2
+            while j < len(lines):
+                if re.fullmatch(_AMT, lines[j]):
+                    vals.append(parse_amount(lines[j]))
+                    j += 1
+                    continue
+                # layout variant: the deduction and its reason share a line ("-121,13 PENAL.")
+                same = _AMT_REASON_RE.match(lines[j]) if len(vals) == 1 else None
+                if not same:
+                    break
+                vals.append(parse_amount(same.group(1)))
+                reason = same.group(2).strip()
+                j += 1
             if (
-                j < len(lines)
+                not reason
+                and j < len(lines)
                 and not re.match(r"^[A-Z]{0,4}[\w/\-]*\d{4,}", lines[j])
                 and not lines[j].startswith("Documento")
             ):
