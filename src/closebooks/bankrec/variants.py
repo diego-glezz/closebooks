@@ -35,7 +35,18 @@ class Flags:
     ref_corroborate: bool = False  # weak cited suffixes accepted when they agree on ONE party
     trace_ref: bool = False  # record why _by_reference gave up (debug, no effect on output)
     ref_trust_other: bool = False  # full cited numbers of ONE other party beat the name match
-    complete_near: bool = False  # complete a truncated citation with items close in issue date
+    # complete a truncated citation with items close in issue date. ON since 2026-11-07:
+    # DEV 86.24 -> 86.53, HOLDOUT 85.91 -> 86.20 (ref_completed precision 0.991)
+    complete_near: bool = True
+    complete_k: int = 3  # max uncited items added by the completion subset search
+    trust_no_partial: bool = False  # ref_trust_other only for exact / completed sets (no PARTIAL)
+    unid_known_payer: bool = False  # payer known with open invoices: no UNIDENTIFIED exception
+    # "UNIDENTIFIED selectivo": like unid_known_payer, but cash-like receipts (small or round
+    # amount: cash deposits, POLICIES §3) keep the exception. TRAIN: real UNIDENTIFIED median
+    # 591 and 22 % round; receipts that pay invoices median 10,049 and 1 % round.
+    # ON since 2026-11-07 (merged A+B+C+D code): DEV 88.69 -> 89.22, HOLDOUT 88.56 -> 89.07
+    unid_selective: bool = True
+    unid_small: int = 1000  # account-currency units under which a receipt is "cash-like"
     # --- numeric genes (default = value hard-coded in main)
     subset_recent_days: int = 240
     subset_cap: int = 22

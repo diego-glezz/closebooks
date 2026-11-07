@@ -855,13 +855,27 @@ class Engine:
         res = self._by_homonym(r, ctx, scope, receipt)
         if res:
             return self._finish(res)
+        # POLICIES §3: UNIDENTIFIED = a receipt for which NO open item exists. A known payer with
+        # open invoices we could not pick is not that: keep the category, drop the exception.
+        known = (
+            receipt
+            and (FLAGS.unid_known_payer or FLAGS.unid_selective)
+            and self._payer_has_open(parties, ctx)
+        )
+        if known and FLAGS.unid_selective:
+            # cash-like receipts (small or round) stay UNIDENTIFIED even with a known payer
+            known = not (ctx.cash_c < FLAGS.unid_small * 100 or ctx.cash_c % 100 == 0)
         guess = self.cats.fallback(r)
         if guess:
             exc = "UNIDENTIFIED" if guess == "UNIDENTIFIED" else ""
+            if exc and known:
+                return Result(txn, category=guess, rule="category_learned_fallback_known")
             return Result(txn, category=guess, exception=exc, rule="category_learned_fallback")
         if cat:
             return Result(txn, category=cat, rule="category_fallback")
         if receipt:
+            if known:
+                return Result(txn, category="UNIDENTIFIED", rule="unidentified_known")
             return Result(
                 txn, category="UNIDENTIFIED", exception="UNIDENTIFIED", rule="unidentified"
             )
@@ -1340,7 +1354,8 @@ class Engine:
                 continue
             if res:
                 return Result(r["bank_txn_id"], res, rule="ref_set")
-        if FLAGS.ref_cn_subset:
+        strict = self._ref_other and FLAGS.trust_no_partial  # measured: _other partials ~0.5
+        if FLAGS.ref_cn_subset and not strict:
             # cited invoices paid net of SOME of the party's open credit notes (POLICIES: credit
             # notes are netted): the shortfall must be the unique subset of those credit notes
             res = self._net_of_credits(open_inv + credits, party_credits, ctx)
@@ -1379,11 +1394,25 @@ class Engine:
                     )
                     if res:
                         return Result(r["bank_txn_id"], res, rule="ref_subset")
-        res = settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
+        res = (
+            None
+            if strict
+            else settle(self.book, open_inv, ctx, self.fx, self.terms, allow_partial=True)
+        )
         if res:
             return Result(r["bank_txn_id"], res, rule="ref_partial")
         over = ctx.cash_c > sum(self._signed(i) for i in open_inv + credits) + 1
         return self._why(txn, "cash_above_cited_not_completed" if over else "settle_failed")
+
+    def _payer_has_open(self, parties: list[str], ctx: Ctx) -> bool:
+        """The most likely payer (or its family) has open AR invoices at this date."""
+        if not parties:
+            return False
+        return any(
+            not self.book.items[i].is_credit
+            for q in sorted(self.parties.family(parties[0]))
+            for i in self.book.open_items(q, ctx.booking, "AR")
+        )
 
     def _why(self, txn: str, reason: str) -> None:
         """trace_ref: remember why the reference strategy gave up on this line."""
@@ -1849,7 +1878,7 @@ class Engine:
                     pool,
                     key=lambda i: (abs((_d(self.book.items[i].issue) - anchor).days), i),
                 )[:25]
-            for k in (1, 2, 3):
+            for k in range(1, FLAGS.complete_k + 1):
                 for sub in itertools.combinations(small, k):
                     if abs(sum(self._signed(i) for i in sub) - target) <= tol:
                         return list(sub)

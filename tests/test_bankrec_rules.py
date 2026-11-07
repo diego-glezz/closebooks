@@ -497,8 +497,9 @@ def test_flags_defaults():
     from closebooks.bankrec.variants import Flags
 
     f = Flags()
-    assert f.two_pass_party and f.ref_cn_subset and f.ref_po  # ON after measuring them
-    assert not any((f.ref_corroborate, f.ref_trust_other, f.complete_near, f.trace_ref))
+    assert f.two_pass_party and f.ref_cn_subset and f.ref_po and f.complete_near  # measured ON
+    assert f.unid_selective and f.unid_small == 1000
+    assert not any((f.ref_corroborate, f.ref_trust_other, f.trace_ref, f.unid_known_payer))
     assert not any((f.iban_learn, f.name_fuzzy, f.ref_fuzzy, f.fifo_subset))
     assert (f.exact_recent_days, f.stale_days) == (0, 0)
     assert (f.subset_recent_days, f.subset_cap, f.subset_max_items) == (240, 22, 5)
