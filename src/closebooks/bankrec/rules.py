@@ -108,6 +108,8 @@ class Ctx:
     orig_ccy: str
     international: bool  # cross-border from outside SEPA (charges possible)
     payer_country: str
+    # learned from TRAIN before the window: currency -> shortfalls (cents) of intermediary fees
+    fees: dict[str, list[int]] | None = None
 
 
 def _days(d: str) -> date:
@@ -199,11 +201,18 @@ def settle(
             wh = sum(round(it.total * rate / 100) for it, _ in invoices)
             if abs(diff - wh) <= tol + len(invoices):
                 return full("SHORT_WITHHOLDING")
-    # intermediary bank charges: <= 60 EUR equivalent and <= 2 % of the item
-    if ctx.international and len(invoices) >= 1 and not late_discount:
+    # intermediary bank charges: <= 60 EUR equivalent and <= 2 % of the item. Always ONE invoice
+    # (0 of 1130 SBC in TRAIN span several), and when the currency has a learned fee schedule
+    # the shortfall has to be one of its fees.
+    known = (ctx.fees or {}).get(iccy)
+    hit = bool(known) and any(abs(diff - f) <= 2 for f in known)
+    # a non-EUR fee from the learned schedule is specific enough (e.g. 11.85 USD) to need no
+    # "international" hint; EUR fees (10, 15, 20...) are round and need it
+    if (ctx.international or (hit and iccy != "EUR")) and len(invoices) == 1 and not late_discount:
         eur = fx.convert(diff, iccy, "EUR", ctx.booking) or diff
-        biggest = max(o for _, o in invoices)
-        if eur <= 6000 and diff <= 0.02 * biggest:
+        biggest = invoices[0][1]
+        on_schedule = not known or hit
+        if eur <= 6000 and diff <= 0.02 * biggest and on_schedule:
             return full("SHORT_BANK_CHARGES")
     if not allow_partial:
         return None
@@ -251,6 +260,11 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
         r"IMPUESTOS|AEAT|MOD\.? ?\d{3}|HACIENDA|DGFIP|FINANZAMT|TAX PAYMENT|IMPOTS|TVA |IRS |SAT ",
         "TAX_PAYMENT",
     ),
+    (
+        # before the loans: "PRESTAMO INTRAGRUPO" is intercompany financing (POLICIES §4)
+        r"INTERCOMPANY|INTRAGRUPO|FINANCIACION (?:GRUPO|IC)\b|INTRAGROUPE|KONZERN",
+        "INTERCOMPANY",
+    ),
     (r"LEASING|RENTING|CREDIT[- ]BAIL", "LEASING"),
     (
         r"DISPOSICION (?:PRESTAMO|POLIZA)|LOAN DRAWDOWN|DEBLOCAGE PRET|KREDITAUSZAHLUNG",
@@ -281,19 +295,49 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
         r"TRASPASO|TRANSFER BETWEEN OWN|VIREMENT INTERNE|UMBUCHUNG|INTERNAL TRANSFER",
         "INTERNAL_TRANSFER",
     ),
-    (
-        r"INTERCOMPANY|INTRAGRUPO|PRESTAMO INTRAGRUPO|FINANCIACION GRUPO|INTRAGROUPE|KONZERN",
-        "INTERCOMPANY",
-    ),
 ]
 _COMPILED = [(re.compile(p), c) for p, c in _CATEGORY_RULES]
 
+# Categories that depend on the sign of the line (POLICIES §4). Each pattern holds 100 % of the
+# labelled lines in TRAIN: a receipt that pays a proforma is a customer advance; a debit that
+# refunds a duplicate payment is a customer refund; a receipt "pago doble" is a supplier refund.
+# ("REEMBOLSO <nº>" is not here: it can settle a supplier credit note, an item.)
+_RECEIPT_RULES = [
+    (re.compile(r"PROFORMA|\bPF\d{2}-\d"), "CUSTOMER_ADVANCE"),
+    (re.compile(r"PAGO DOBLE|DOBLE PAGO|PAGO DUPLICADO"), "SUPPLIER_REFUND"),
+]
+_DEBIT_RULES = [
+    (
+        re.compile(
+            r"REFUND DUPLICATE|DUPLICATE PAYMENT REFUND|DEVOLUCION PAGO DUPLICADO|PAGO DOBLE"
+        ),
+        "CUSTOMER_REFUND",
+    ),
+]
 
-def category_by_text(text: str) -> str | None:
+
+def category_by_text(text: str, receipt: bool | None = None) -> str | None:
+    """Category of a line that settles no item, from its text. `receipt` (money in) enables the
+    rules that depend on the sign of the line."""
     t = fold(text)
+    if receipt is not None:
+        for rx, cat in _RECEIPT_RULES if receipt else _DEBIT_RULES:
+            if rx.search(t):
+                return cat
     for rx, cat in _COMPILED:
         if rx.search(t):
             return cat
+    return None
+
+
+# Refund of a payment made twice (POLICIES §4): our outgoing refund to a customer is
+# CUSTOMER_REFUND, the incoming refund from a supplier is SUPPLIER_REFUND.
+DUP_REFUND_RX = re.compile(r"PAGO DOBLE|DUPLICA|DOPPEL|DOUBLE|DOPPIO|DUBBEL")
+
+
+def duplicate_refund_category(text: str, receipt: bool) -> str | None:
+    if DUP_REFUND_RX.search(fold(text)):
+        return "SUPPLIER_REFUND" if receipt else "CUSTOMER_REFUND"
     return None
 
 
@@ -320,6 +364,23 @@ def deduction_kind(reason: str) -> str:
     if _DISCOUNT_RX.search(t):
         return "discount"
     if _WITHHOLD_RX.search(t):
+        return "withholding"
+    return "dispute"
+
+
+def deduction_kind_by_amount(
+    it: Item, deduction_c: int, terms: dict[str, tuple[float, int]], payer_country: str
+) -> str:
+    """Classify a deduction that states no reason (the 2025-09 advice layout), by its amount:
+    the early-payment discount of the invoice terms, a tax withheld at source (POLICIES §3), or
+    else a dispute. The discount may be taken late: it is still a discount (-> PARTIAL)."""
+    ded = abs(deduction_c)
+    pct, _ = terms.get(it.terms, (0.0, 0))
+    if pct and not it.is_credit and abs(ded - round(it.total * pct / 100)) <= 1:
+        return "discount"
+    if payer_country in WITHHOLDING_COUNTRIES and any(
+        abs(ded - round(it.total * rate / 100)) <= 1 for rate in WITHHOLDING_RATES
+    ):
         return "withholding"
     return "dispute"
 

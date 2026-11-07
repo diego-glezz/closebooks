@@ -71,6 +71,7 @@ class Advice:
 _LINE_RE = re.compile(
     rf"^\s*([A-Z]{{0,4}}[\w/\-\.]*\d[\w/\-\.]*)\s+({_DATE})\s+({_AMT})(?:\s+({_AMT}))?\s*(.*)$"
 )
+_AMT_REASON_RE = re.compile(rf"^({_AMT})\s+([^\d\s].*)$")
 _REF_RE = re.compile(r"^Subject:.*?([A-Z0-9][A-Z0-9/\-]*\d[A-Z0-9/\-]*)\s*$", re.I | re.M)
 _TOTAL_RE = re.compile(rf"({_AMT})\s*(EUR|USD|GBP|CHF|PLN|MXN|BRL|MAD|CNY|AUD|CAD|ZAR)")
 
@@ -99,7 +100,11 @@ _NUM_HEADERS = ("document", "invoice", "doc", "factura", "rechnung", "facture", 
 
 def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
     rows = [[c.strip() for c in r] for r in rows if r and any(c.strip() for c in r)]
-    header_at = next((k for k, r in enumerate(rows) if r[0].lower() in _NUM_HEADERS), None)
+    # the header row is the first one naming a document-number column; the column can be
+    # anywhere (the layout of one big customer changed in 2025-09: Voucher | Invoice | PO | ...)
+    header_at = next(
+        (k for k, r in enumerate(rows) if any(c.lower() in _NUM_HEADERS for c in r)), None
+    )
     if header_at is None:
         return
     for r in rows[
@@ -116,8 +121,9 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
             adv.pay_date = r[2] if len(r) > 2 else adv.pay_date
     header = [h.lower() for h in rows[header_at]]
     idx = {h: n for n, h in enumerate(header)}
+    num_col = next(n for n, h in enumerate(header) if h in _NUM_HEADERS)
     for r in rows[header_at + 1 :]:
-        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL"):
+        if r[0].upper() in ("TOTAL", "TOTALES", "SUMME", "TOTAL GENERAL") or len(r) <= num_col:
             continue
 
         def get(*names: str, r: list[str] = r) -> str:
@@ -127,13 +133,16 @@ def _parse_csv_rows(rows: list[list[str]], adv: Advice) -> None:
             return ""
 
         try:
-            ln = AdviceLine(number=r[0], gross_c=parse_amount(get("gross", "importe") or "0"))
+            ln = AdviceLine(
+                number=r[num_col], gross_c=parse_amount(get("gross", "importe", "amount") or "0")
+            )
             ded = get("discount_or_deduction", "deduction", "deduccion", "abzug")
             if ded and parse_amount(ded) != 0:
                 ln.deduction_c = -abs(parse_amount(ded))
             ln.reason = get("reason", "motivo", "grund")
-            if get("paid", "pagado", "bezahlt"):
-                ln.paid_c = parse_amount(get("paid", "pagado", "bezahlt"))
+            paid = get("paid", "net paid", "net_paid", "pagado", "bezahlt")
+            if paid:
+                ln.paid_c = parse_amount(paid)
         except ValueError:
             continue
         adv.lines.append(ln)
@@ -160,13 +169,23 @@ def _parse_pdf_text(text: str, adv: Advice) -> None:
             and re.match(_DATE, lines[i + 1])
         ):
             vals = []
-            j = i + 2
-            while j < len(lines) and re.fullmatch(_AMT, lines[j]):
-                vals.append(parse_amount(lines[j]))
-                j += 1
             reason = ""
+            j = i + 2
+            while j < len(lines):
+                if re.fullmatch(_AMT, lines[j]):
+                    vals.append(parse_amount(lines[j]))
+                    j += 1
+                    continue
+                # layout variant: the deduction and its reason share a line ("-121,13 PENAL.")
+                same = _AMT_REASON_RE.match(lines[j]) if len(vals) == 1 else None
+                if not same:
+                    break
+                vals.append(parse_amount(same.group(1)))
+                reason = same.group(2).strip()
+                j += 1
             if (
-                j < len(lines)
+                not reason
+                and j < len(lines)
                 and not re.match(r"^[A-Z]{0,4}[\w/\-]*\d{4,}", lines[j])
                 and not lines[j].startswith("Documento")
             ):
@@ -188,7 +207,7 @@ def load_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
 
     out: list[Advice] = []
     for r in index_rows:
-        path = folder / r["file"]
+        path = Path(r["_folder"]) / r["file"] if r.get("_folder") else folder / r["file"]
         if not path.exists():
             continue
         adv = Advice(
@@ -231,10 +250,25 @@ def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, st
     texts: dict[str, str] = {}
     if cache.exists():
         texts = json.loads(cache.read_text(encoding="utf-8"))
-    missing = [r["file"] for r in index_rows if r["file"] not in texts]
-    for f in missing:
+    missing = [r for r in index_rows if r["file"] not in texts]
+    # rows of an earlier phase (LIVE/FINAL context): reuse the text already extracted for that
+    # phase's own runs (pdf_text_train_*.json...) instead of parsing thousands of PDFs again
+    for src in sorted({r["_src"] for r in missing if r.get("_src")}):
+        want = {r["file"] for r in missing if r.get("_src") == src}
+        for other in sorted(cache.parent.glob(f"pdf_text_{src}*.json")):
+            if not want:
+                break
+            seen = json.loads(other.read_text(encoding="utf-8"))
+            for f in sorted(want & seen.keys()):
+                texts[f] = seen[f]
+            want -= seen.keys()
+    for r in missing:
+        f = r["file"]
+        if f in texts:
+            continue
+        base = Path(r["_folder"]) if r.get("_folder") else folder
         try:
-            texts[f] = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(folder / f).pages)
+            texts[f] = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(base / f).pages)
         except Exception:
             texts[f] = ""
     if missing:

@@ -36,35 +36,122 @@ def run(
         write_explain,
     )
 
+    steps = _Steps(6)
     t0 = time.time()
     if start and end:
         from closebooks.bankrec.data import load_window
 
+        steps(f"cargar datos: ventana de TRAIN {start} → {end}")
         ph = load_window(data, start, end)
         phase = ph.name
     else:
+        steps(f"cargar datos: fase {phase}")
         ph = load_phase(data, phase)
     t1 = time.time()
+    steps("modelo de categorías (aprendido de TRAIN; se reutiliza si ya existe)")
     cat_model = _category_model(data, ph.name, start)
-    eng = Engine(ph, category_model=cat_model)
+    steps(f"preparar el motor ({len(ph.bank):,} movimientos)".replace(",", "."))
+    eng = Engine(ph, category_model=cat_model, on_step=steps.sub)
     t2 = time.time()
-    results = eng.run()
+    steps("emparejar movimientos con partidas")
+    results = _run_with_progress(eng)
     t3 = time.time()
     out = out or Path("out") / phase / "submission.csv.gz"
+    steps(f"escribir {out} y explain.csv.gz")
     write_csv(results, out)
     write_explain(results, out.parent / "explain.csv.gz")
+    scored = ph.golden is not None and do_score
+    steps("puntuar con el evaluador oficial" if scored else "validar con el evaluador oficial")
+    res = score_phase(ph, out) if scored else validate(data, phase, out)
+    if scored:
+        dump(res, out.parent / "score.json")
+    steps.done()
     console.print(
         f"load {t1 - t0:.1f}s · setup {t2 - t1:.1f}s · match {t3 - t2:.1f}s · "
         f"{len(results)} lines -> {out}"
     )
     console.print(dict(rule_counts(results).most_common()))
-    if ph.golden is not None and do_score:
-        res = score_phase(ph, out)
-        dump(res, out.parent / "score.json")
+    if scored:
         _print_score(res)
     else:
-        v = validate(data, phase, out)
-        console.print(v)
+        console.print(res)
+
+
+def _fmt(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _say(msg: str) -> None:
+    console.print(msg)
+    console.file.flush()  # show it now even when stdout is a pipe (Claude Code, logs)
+
+
+class _Steps:
+    """Prints `[i/N] step…` when each step starts and how long the previous one took."""
+
+    def __init__(self, n: int):
+        self.n, self.i, self.t0, self.t = n, 0, time.time(), None
+
+    def _close(self) -> None:
+        if self.t is not None:
+            _say(f"      [dim]hecho en {_fmt(time.time() - self.t)}[/]")
+
+    def __call__(self, msg: str) -> None:
+        self._close()
+        self.i += 1
+        self.t = time.time()
+        _say(f"[cyan][{self.i}/{self.n}][/] {msg}…")
+
+    def sub(self, msg: str) -> None:
+        _say(f"      · {msg}…")
+
+    def done(self) -> None:
+        self._close()
+        self.t = None
+        _say(f"[green]listo en {_fmt(time.time() - self.t0)}[/]")
+
+
+def _run_with_progress(eng):
+    """Engine.run with a live bar in a terminal, or a line every 10 % when piped."""
+    total = len(eng.rows)
+    if console.is_terminal:
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+
+        with Progress(
+            TextColumn("      "),
+            BarColumn(),
+            TextColumn("{task.percentage:>3.0f}%"),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TextColumn("quedan"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as prog:
+            task = prog.add_task("match", total=total)
+            return eng.run(progress=lambda done, _t: prog.update(task, completed=done))
+
+    t0 = time.time()
+    next_pct = [10]
+
+    def report(done: int, _total: int) -> None:
+        pct = done * 100 // max(total, 1)
+        if pct < next_pct[0] and done < total:
+            return
+        el = time.time() - t0
+        rest = el / done * (total - done) if done else 0.0
+        line = f"      {pct:3d}% ({done:,}/{total:,}) · {_fmt(el)} · quedan ~{_fmt(rest)}"
+        _say(line.replace(",", "."))
+        next_pct[0] = (pct // 10 + 1) * 10
+
+    return eng.run(progress=report)
 
 
 def _category_model(data: Path, phase: str, start: str) -> Path | None:
@@ -76,7 +163,7 @@ def _category_model(data: Path, phase: str, start: str) -> Path | None:
     )
     if not before or not (data / "train" / "golden_allocations.csv.gz").exists():
         return None
-    path = Path("out/models") / f"categories_{before}.json"
+    path = Path("out/models") / f"categories_v2_{before}.json"
     if not path.exists():
         build(data, before, path)
     return path

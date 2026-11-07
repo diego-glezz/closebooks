@@ -7,7 +7,14 @@ import pytest
 
 from closebooks.bankrec.book import Book
 from closebooks.bankrec.docs import Advice, _parse_csv_rows, _parse_txt, parse_amount, parse_clauses
-from closebooks.bankrec.rules import FX, RETURN_RX, Ctx, category_by_text, settle
+from closebooks.bankrec.rules import (
+    FX,
+    RETURN_RX,
+    Ctx,
+    category_by_text,
+    duplicate_refund_category,
+    settle,
+)
 from closebooks.bankrec.text import number_keys, service_month, text_tokens
 
 TERMS = {"D2N30": (2.0, 10), "T30": (0.0, 0)}
@@ -87,6 +94,34 @@ def test_categories():
     assert category_by_text("PAG NOMINAS | NOMINAS 01/2022") == "PAYROLL"
     assert category_by_text("IMPUESTOS MOD 111 202110") == "TAX_PAYMENT"
     assert category_by_text("COMISION TRANSF. EXTERIOR") == "BANK_FEES"
+
+
+def test_duplicate_payment_refund_category_depends_on_sign():
+    assert duplicate_refund_category("REFUND DUPLICATE PAYMENT", receipt=False) == "CUSTOMER_REFUND"
+    assert duplicate_refund_category("ABONO PAGO DOBLE", receipt=True) == "SUPPLIER_REFUND"
+    assert duplicate_refund_category("TRANSF FERRETERIA GOMEZ FRA 1003", receipt=True) is None
+
+
+def test_intercompany_loan_is_intercompany_not_loan_repayment():
+    assert category_by_text("PRESTAMO INTRAGRUPO CUOTA") == "INTERCOMPANY"
+    assert category_by_text("CUOTA PRESTAMO HIPOTECARIO") == "LOAN_REPAYMENT"
+
+
+def test_sign_dependent_categories():
+    """POLICIES §4: proforma receipt -> advance; duplicate refund debit -> customer refund."""
+    pf = "SEPA-UEBERWEISUNG SVWZ+PROFORMA PF25-0123 RHEI9"
+    assert category_by_text(pf, receipt=True) == "CUSTOMER_ADVANCE"
+    assert category_by_text("ACH CREDIT X CCD RMR*IV*PF25-0123*PI*10.00", receipt=True) == (
+        "CUSTOMER_ADVANCE"
+    )
+    assert category_by_text(pf) is None  # without the sign nothing is decided
+    assert category_by_text(pf, receipt=False) is None  # a debit naming a proforma is not one
+    dup = "ACH DEBIT LAKE HARMON POOL VENDOR PMT HPNB REFUND DUPLICATE PAYMENT 123"
+    assert category_by_text(dup, receipt=False) == "CUSTOMER_REFUND"
+    assert category_by_text(dup, receipt=True) is None
+    assert category_by_text("SVWZ+ABONO PAGO DOBLE RHEI", receipt=True) == "SUPPLIER_REFUND"
+    # "REEMBOLSO <nº>" may settle a supplier credit note: never a category by text alone
+    assert category_by_text("SVWZ+REEMBOLSO FV-25-123 RHEI", receipt=True) is None
 
 
 # ---------------------------------------------------------------- documents
@@ -193,6 +228,48 @@ def test_international_bank_charges():
     assert (a[0].amount_c, a[0].exception) == (191944, "SHORT_BANK_CHARGES")
 
 
+def test_bank_charges_never_span_several_invoices():
+    b = make_book(
+        ("ARI-2025-0000001", "FV21-1", 100000, "2025-05-01"),
+        ("ARI-2025-0000002", "FV21-2", 100000, "2025-05-02"),
+    )
+    a = settle(
+        b,
+        ["ARI-2025-0000001", "ARI-2025-0000002"],
+        ctx(198000, international=True),
+        FX_RATES,
+        TERMS,
+    )
+    assert "SHORT_BANK_CHARGES" not in {x.exception for x in a}
+
+
+def test_bank_charges_must_follow_learned_fee_schedule():
+    b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01"))
+    ids = ["ARI-2025-0000001"]
+    on = ctx(189444, international=True, fees={"EUR": [1500, 2500]})
+    off = ctx(189444 + 500, international=True, fees={"EUR": [1500, 2500]})
+    assert settle(b, ids, on, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+    assert settle(b, ids, off, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    # a currency without learned schedule keeps the generic rule
+    other = ctx(189444, international=True, fees={"USD": [1185]})
+    assert settle(b, ids, other, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+
+
+def test_bank_charges_non_eur_fee_on_schedule_needs_no_international_hint():
+    b = make_book(("ARI-2025-0000001", "FV21-1", 191944, "2025-05-01", "T30", "USD"))
+    ids = ["ARI-2025-0000001"]
+    on = ctx(191944 - 1185, ccy="USD", fees={"USD": [1185]})
+    off = ctx(191944 - 1186 * 3, ccy="USD", fees={"USD": [1185]})
+    assert settle(b, ids, on, FX_RATES, TERMS)[0].exception == "SHORT_BANK_CHARGES"
+    assert settle(b, ids, off, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    # the same fee in EUR is round and still needs the international hint
+    e = make_book(("ARI-2025-0000002", "FV21-2", 191944, "2025-05-01"))
+    eur = ctx(191944 - 1500, fees={"EUR": [1500]})
+    assert (
+        settle(e, ["ARI-2025-0000002"], eur, FX_RATES, TERMS)[0].exception != "SHORT_BANK_CHARGES"
+    )
+
+
 def test_partial_payment_keeps_cash_amount():
     b = make_book(("ARI-2025-0000001", "FV22-1", 82251, "2025-05-01"))
     a = settle(b, ["ARI-2025-0000001"], ctx(20562), FX_RATES, TERMS)
@@ -218,6 +295,71 @@ def test_deduction_kind():
     assert deduction_kind("RET") == "withholding"
     assert deduction_kind("DAMAGED GOODS") == "dispute"
     assert deduction_kind("PENAL. RETRASO") == "dispute"
+
+
+def test_parse_xlsx_advice_layout_of_2025_09():
+    """Voucher | Invoice | PO | Inv. date | Amount | Deduction | Net paid (no reason column)."""
+    adv = Advice(file="x.xlsx", entity="AU01", payer="P", received="")
+    _parse_csv_rows(
+        [
+            ["Pool & Spa Sol Pty Ltd", "", "", "", "", "", ""],
+            ["Payment advice", "2057001209", "2025-09-01", "", "", "", ""],
+            ["Voucher", "Invoice", "PO", "Inv. date", "Amount", "Deduction", "Net paid"],
+            ["VCHR65740934", "320871", "4517600404", "2024-09-13", "1044.09", "0", "1044.09"],
+            ["VCHR04037863", "306817", "4554233277", "2025-03-10", "4943.81", "-98.88", "4844.93"],
+        ],
+        adv,
+    )
+    assert adv.ref == "2057001209" and adv.pay_date == "2025-09-01"
+    assert [ln.number for ln in adv.lines] == ["320871", "306817"]  # the invoice, not the voucher
+    assert adv.lines[0].gross_c == 104409 and adv.lines[0].paid == 104409
+    assert adv.lines[1].deduction_c == -9888 and adv.lines[1].paid == 484493
+    assert adv.lines[1].reason == ""
+
+
+def test_parse_pdf_advice_deduction_and_reason_on_one_line():
+    from closebooks.bankrec.docs import _parse_pdf_text
+
+    adv = Advice(file="x.pdf", entity="DE01", payer="P", received="")
+    _parse_pdf_text(
+        "REMITTANCE ADVICE\nDocument\nDate\nGross\nDeduction\nPaid\n"
+        "RE250106321\n04/04/2025\n4,371.12\n4,371.12\n"
+        "RE250106102\n02/04/2025\n2,422.74\n-121.13 PENAL. RETRASO\n2,301.61\n"
+        "RE250106165\n03/04/2025\n2,708.15\n2,708.15\n",
+        adv,
+    )
+    assert [ln.number for ln in adv.lines] == ["RE250106321", "RE250106102", "RE250106165"]
+    ln = adv.lines[1]
+    assert (ln.gross_c, ln.deduction_c, ln.paid_c) == (242274, -12113, 230161)
+    assert ln.reason == "PENAL. RETRASO"
+    assert adv.lines[2].paid == 270815  # the table keeps being read after the deduction
+
+
+def test_deduction_without_reason_is_classified_by_amount():
+    from closebooks.bankrec.rules import deduction_kind_by_amount
+
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20", "D2N30"))
+    it = book.items["ARI-2025-0000001"]
+    assert deduction_kind_by_amount(it, -2000, TERMS, "ES") == "discount"  # 2 % of the total
+    assert deduction_kind_by_amount(it, -1500, TERMS, "ES") == "dispute"
+    assert deduction_kind_by_amount(it, -1500, TERMS, "MX") == "withholding"  # 1.5 %
+    assert deduction_kind_by_amount(it, -1500, TERMS, "BR") == "withholding"
+    plain = make_book(("ARI-2025-0000002", "FV25-2", 100000, "2025-05-20", "T30"))
+    assert (
+        deduction_kind_by_amount(plain.items["ARI-2025-0000002"], -2000, TERMS, "ES") == "dispute"
+    )
+
+
+def test_returned_never_reopens_more_than_the_document():
+    book = make_book(("ARI-2025-0000001", "FV25-1", 100000, "2025-05-20"))
+    iid = "ARI-2025-0000001"
+    # window that starts after the original payment: the item is still open for its total
+    book.apply("BT-RET", iid, 100000, "RETURNED")
+    assert book.open[iid] == 100000
+    book.apply("BT-PAY", iid, 100000, "")
+    assert book.open[iid] == 0
+    book.apply("BT-RET2", iid, 100000, "RETURNED")  # with history it does re-open the amount
+    assert book.open[iid] == 100000
 
 
 def test_pdf_payment_plans():
