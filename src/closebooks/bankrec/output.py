@@ -116,7 +116,10 @@ def validate(root: Path, phase: str, submission: Path) -> dict:
     Runs the official scorer with an empty golden, so format errors match the server's."""
     S = _scorer(root)
     folder = root / phase
-    with open(root / "masters" / "categories.csv", encoding="utf-8") as fh:
+    masters = root / "final" / "masters_final"
+    if phase != "final" or not (masters / "categories.csv").exists():
+        masters = root / "masters"
+    with open(masters / "categories.csv", encoding="utf-8") as fh:
         cats = [r["category"] for r in csv.DictReader(fh)]
     tmp_g = submission.parent / ".empty_golden.csv.gz"
     with gzip.open(tmp_g, "wt") as out:

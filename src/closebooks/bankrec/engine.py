@@ -24,7 +24,7 @@ import pandas as pd
 
 from closebooks.bankrec.book import Book, Parties
 from closebooks.bankrec.data import Phase, cents
-from closebooks.bankrec.docs import Advice, load_advices, parse_clauses, pdf_texts
+from closebooks.bankrec.docs import Advice, load_advices, pdf_clauses
 from closebooks.bankrec.learn import CategoryModel
 from closebooks.bankrec.rules import (
     FX,
@@ -128,11 +128,9 @@ class Engine:
         if self.ph.pdf_index.empty:
             return
         rows = self.ph.pdf_index.to_dict("records")
-        texts = pdf_texts(
-            self.ph.folder / "pdfs", rows, self.cache_dir / f"pdf_text_{self.ph.name}.json"
-        )
+        clauses = pdf_clauses(self.ph.folder / "pdfs", rows, self.cache_dir, self.ph.name)
         for r in rows:
-            c = parse_clauses(texts.get(r["file"], ""))
+            c = clauses[r["file"]]
             dtype = r["document_type"]
             if dtype == "bank_account_notice" and c.new_iban and r.get("party_id"):
                 self.parties.add_iban(c.new_iban, r["party_id"])
@@ -395,7 +393,9 @@ class Engine:
         # --- remittance advices (customer payments of many invoices)
         if not ph.remit_index.empty:
             advices = load_advices(
-                ph.folder / "remittance_advices", ph.remit_index.to_dict("records")
+                ph.folder / "remittance_advices",
+                ph.remit_index.to_dict("records"),
+                self.cache_dir / f"advices_{ph.name}.pkl",
             )
             pos_by_amt: dict[int, list[int]] = defaultdict(list)
             for i, r in enumerate(self.rows):

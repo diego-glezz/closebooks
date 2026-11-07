@@ -1,14 +1,19 @@
 """Parse remittance advices (csv/txt/xlsx/pdf) and free-text clauses of document PDFs.
 
 PDF text extraction is slow (~10 ms/page): results are cached in out/cache/pdf_text_<phase>.json.
+Parsed results (clauses of document PDFs, remittance advices) are cached as pickles keyed by the
+hash of this module's source, so any change to a parser invalidates them automatically.
 """
 
 from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import io
 import json
+import os
+import pickle
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,7 +206,63 @@ def _parse_pdf_text(text: str, adv: Advice) -> None:
             i += 1
 
 
-def load_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
+_PARSER_VERSION = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()
+
+
+def _load_pickle(path: Path | None) -> dict:
+    if path is None or not path.exists():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            ver, data = pickle.load(fh)
+    except Exception:
+        return {}
+    return data if ver == _PARSER_VERSION else {}
+
+
+def _save_pickle(path: Path | None, data: dict) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with tmp.open("wb") as fh:
+        pickle.dump((_PARSER_VERSION, data), fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)  # atomic: a concurrent run never reads a half-written cache
+
+
+def load_advices(folder: Path, index_rows: list[dict], cache: Path | None = None) -> list[Advice]:
+    """Parse every advice of the index (in index order). With `cache`, advices already parsed by
+    an earlier run (same file path, same parser source) are reused instead of parsed again."""
+    cached = _load_pickle(cache)
+    fresh: dict[str, Advice] = {}
+    out: list[Advice] = []
+    for r in index_rows:
+        path = Path(r["_folder"]) / r["file"] if r.get("_folder") else folder / r["file"]
+        key = "|".join(
+            str(x)
+            for x in (
+                path,
+                r.get("entity", ""),
+                r.get("payer_name", ""),
+                r.get("received_date", ""),
+                r.get("format", ""),
+            )
+        )
+        if key in cached:
+            adv = cached[key]
+        else:
+            got = _parse_advices(folder, [r])
+            if not got:
+                continue
+            adv = got[0]
+        fresh[key] = adv
+        out.append(adv)
+    if cache is not None and fresh.keys() != cached.keys():
+        _save_pickle(cache, fresh)
+    return out
+
+
+def _parse_advices(folder: Path, index_rows: list[dict]) -> list[Advice]:
     import openpyxl
     import pypdf
 
@@ -275,6 +336,21 @@ def pdf_texts(folder: Path, index_rows: list[dict], cache: Path) -> dict[str, st
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
     return texts
+
+
+def pdf_clauses(folder: Path, index_rows: list[dict], cache_dir: Path, name: str) -> dict:
+    """file -> DocClauses for every PDF of the index. Parsed clauses are cached in
+    out/cache/pdf_clauses_<name>.pkl; the (large) text cache is only opened for files not parsed
+    yet, so a warm run skips both the 40 MB JSON and ~66,000 regex passes."""
+    path = cache_dir / f"pdf_clauses_{name}.pkl"
+    cached = _load_pickle(path)
+    missing = [r for r in index_rows if r["file"] not in cached]
+    if missing:
+        texts = pdf_texts(folder, index_rows, cache_dir / f"pdf_text_{name}.json")
+        for r in missing:
+            cached[r["file"]] = parse_clauses(texts.get(r["file"], ""))
+        _save_pickle(path, cached)
+    return cached
 
 
 @dataclass
@@ -373,5 +449,6 @@ __all__ = [
     "load_advices",
     "parse_amount",
     "parse_clauses",
+    "pdf_clauses",
     "pdf_texts",
 ]

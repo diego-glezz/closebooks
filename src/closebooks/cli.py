@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -334,6 +335,104 @@ def history() -> None:
             h.get("note", ""),
         )
     console.print(t)
+
+
+def _find_final(ref: str, root: Path) -> Path:
+    """`ref` = path to final.json or to its folder, a sub_id (s_...) or a folder-name prefix."""
+    p = Path(ref)
+    if p.is_file():
+        return p
+    if (p / "final.json").is_file():
+        return p / "final.json"
+    for f in sorted(root.glob("*/final.json")):
+        if f.parent.name.startswith(ref):
+            return f
+        with contextlib.suppress(Exception):
+            if json.loads(f.read_text(encoding="utf-8")).get("sub_id") == ref:
+                return f
+    raise typer.BadParameter(f"no encuentro final.json para {ref!r} en {root}")
+
+
+def compare_finals(a: dict, b: dict) -> tuple[list[tuple[str, float, float, float]], list[dict]]:
+    """Headline metric deltas and per-segment rows (b - a), sorted by impact = n * delta."""
+    ma, mb = a.get("metrics", {}), b.get("metrics", {})
+    heads = [("score", a.get("score") or 0.0, b.get("score") or 0.0)]
+    for k in (
+        "allocation_f1",
+        "allocation_precision",
+        "allocation_recall",
+        "txn_accuracy",
+        "exception_macro_f1",
+        "amount_weighted_accuracy",
+    ):
+        if k in ma or k in mb:
+            heads.append((k, ma.get(k) or 0.0, mb.get(k) or 0.0))
+    head_rows = [(k, va, vb, vb - va) for k, va, vb in heads]
+    sa = {s["segment"]: s for s in ma.get("segments", [])}
+    sb = {s["segment"]: s for s in mb.get("segments", [])}
+    rows = []
+    for seg in sorted(sa.keys() | sb.keys()):
+        x, y = sa.get(seg, {}), sb.get(seg, {})
+        n = y.get("n", x.get("n", 0))
+        acc_a, acc_b = x.get("accuracy"), y.get("accuracy")
+        d = (acc_b - acc_a) if acc_a is not None and acc_b is not None else 0.0
+        rows.append({"segment": seg, "n": n, "a": acc_a, "b": acc_b, "delta": d, "lines": d * n})
+    rows.sort(key=lambda r: (-abs(r["lines"]), r["segment"]))
+    return head_rows, rows
+
+
+@app.command(name="report-live")
+def report_live(
+    a: str = typer.Argument("", help="envío base (sub_id, carpeta, final.json); def. penúltimo"),
+    b: str = typer.Argument("", help="envío nuevo; por defecto el último"),
+    root: Path = typer.Option(Path("out/submissions"), help="carpeta de envíos"),
+    top: int = typer.Option(25, help="segmentos a mostrar (por impacto)"),
+) -> None:
+    """Compare the final.json of two submissions by segment: what went up and what went down."""
+    scored = [
+        f
+        for f in sorted(root.glob("*/final.json"))
+        if json.loads(f.read_text(encoding="utf-8")).get("metrics")
+    ]
+    if not (a and b) and len(scored) < 2:
+        raise typer.BadParameter(f"hacen falta dos final.json con métricas en {root}")
+    fa = _find_final(a, root) if a else scored[-2]
+    fb = _find_final(b, root) if b else scored[-1]
+    ja, jb = (json.loads(f.read_text(encoding="utf-8")) for f in (fa, fb))
+    heads, rows = compare_finals(ja, jb)
+    console.print(f"A = {fa.parent.name} ({ja.get('phase')}, {ja.get('score')})")
+    console.print(f"B = {fb.parent.name} ({jb.get('phase')}, {jb.get('score')})")
+    t = Table(title="métricas (B - A)")
+    for c in ("métrica", "A", "B", "Δ"):
+        t.add_column(c, justify="left" if c == "métrica" else "right")
+    for k, va, vb, d in heads:
+        color = "green" if d > 0 else "red" if d < 0 else ""
+        fmt = "{:.2f}" if k == "score" else "{:.4f}"
+        t.add_row(k, fmt.format(va), fmt.format(vb), f"[{color}]{d:+.4f}[/]" if color else "0")
+    console.print(t)
+    t = Table(title=f"segmentos que cambian, por impacto (n × Δaccuracy), top {top}")
+    for c in ("segmento", "n", "A", "B", "Δ", "líneas"):
+        t.add_column(c, justify="left" if c == "segmento" else "right")
+
+    def acc(v: float | None) -> str:
+        return "—" if v is None else f"{v:.3f}"
+
+    for r in [r for r in rows if r["lines"] or r["a"] is None or r["b"] is None][:top]:
+        color = "green" if r["delta"] > 0 else "red" if r["delta"] < 0 else ""
+        t.add_row(
+            r["segment"],
+            str(r["n"]),
+            acc(r["a"]),
+            acc(r["b"]),
+            f"[{color}]{r['delta']:+.3f}[/]" if color else "0",
+            f"{r['lines']:+.0f}",
+        )
+    console.print(t)
+    up = sum(r["lines"] for r in rows if r["lines"] > 0)
+    down = sum(r["lines"] for r in rows if r["lines"] < 0)
+    console.print(
+        f"líneas ganadas ≈ {up:+.0f} · perdidas ≈ {down:+.0f} (n del servidor redondeado)"
+    )
 
 
 @app.command(name="report")
