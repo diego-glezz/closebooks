@@ -61,6 +61,7 @@ _INSTALMENT_RX = re.compile(
 # the payment of what was left open: last instalment or the settlement of a disputed amount
 # (TRAIN: single-invoice "SETTLEMENT" lines are never PARTIAL)
 _REMAINDER_RX = re.compile(r"\bSETTLEMENT\b|" + _INSTALMENT_RX.pattern)
+_N_SUPPLIERS = re.compile(r"\b(\d+) PROVEEDOR")
 
 
 @dataclass
@@ -341,7 +342,7 @@ class Engine:
             for x in recs:
                 xfer.setdefault(x["end_to_end_id"], abs(int(x["xfer_c"])))
             keys = sorted(xfer)
-            if not keys or len(keys) > 30:
+            if not keys:
                 continue
             vals = [xfer[k] for k in keys]
             first_day = str(g.iloc[0]["execution_date"])
@@ -349,6 +350,15 @@ class Engine:
                 r = self.rows[i]
                 amt = -int(r["amount_c"])
                 if r["bank_txn_id"] in self.linked or amt <= 0 or r["booking_date"] < first_day:
+                    continue
+                if len(keys) > 30:
+                    # big run: too many subsets, but a debit for ONE supplier ("1 PROVEEDORES")
+                    # is the only transfer of the run for exactly that amount
+                    m = _N_SUPPLIERS.search(fold(f"{r['text']} {r['ref1']} {r['ref2']}"))
+                    single = [k for k in keys if abs(xfer[k] - amt) <= 1]
+                    if m and int(m.group(1)) == 1 and len(single) == 1:
+                        payload = [x for x in recs if x["end_to_end_id"] == single[0]]
+                        self.linked[r["bank_txn_id"]] = ("run_conf1", payload)
                     continue
                 sols = subset_solutions(vals, amt, 1)
                 if sols and len(sols) == 1:
@@ -370,11 +380,15 @@ class Engine:
 
     def _link_details(self) -> None:
         ph = self.ph
+        self.run_by_e2e: dict[str, list[dict]] = defaultdict(list)
         # --- outgoing payment runs (AP)
         if not ph.runs.empty:
             runs = ph.runs.copy()
             runs["doc_c"] = cents(runs["document_amount"])
             runs["xfer_c"] = cents(runs["transfer_amount"])
+            for row in runs.to_dict("records"):  # transfers that may come back rejected
+                if isinstance(row.get("end_to_end_id"), str) and row["end_to_end_id"]:
+                    self.run_by_e2e[alnum(row["end_to_end_id"])].append(row)
             conf = runs[runs["run_type"] == "confirming"]
             if not conf.empty:
                 self._link_confirming(conf)
@@ -423,9 +437,15 @@ class Engine:
                         self.linked[t] = ("confirming", conf)
             self._link_fx_runs(runs)
         # --- direct-debit batches
+        # a returned collection names its mandate: the collections of each mandate tell which
+        # document was collected (and so which one comes back)
+        self.dd_by_mandate: dict[str, list[dict]] = defaultdict(list)
         if not ph.dd.empty:
             dd = ph.dd.copy()
             dd["amt_c"] = cents(dd["amount"])
+            for row in dd.sort_values(["collection_date", "end_to_end_id"]).to_dict("records"):
+                if isinstance(row.get("mandate_id"), str) and row["mandate_id"]:
+                    self.dd_by_mandate[alnum(row["mandate_id"])].append(row)
             for bid, g in dd.groupby("batch_id"):
                 g0 = g.iloc[0]
                 total = int(cents(pd.Series([g0["batch_total"]])).iloc[0]) or int(g["amt_c"].sum())
@@ -707,10 +727,36 @@ class Engine:
                     and self.by_txn.get(o["bank_txn_id"])
                 ):
                     found[o["bank_txn_id"]] = self.by_txn[o["bank_txn_id"]]
-        if len(found) != 1:  # none, or ambiguous: do not guess
+        if len(found) == 1:
+            allocs = next(iter(found.values()))
+            return Result(
+                txn, [Alloc(i, c, "RETURNED") for i, c in allocs], rule="returned_transfer"
+            )
+        if found:  # ambiguous: do not guess
             return None
-        allocs = next(iter(found.values()))
-        return Result(txn, [Alloc(i, c, "RETURNED") for i, c in allocs], rule="returned_transfer")
+        # the original debit is not in the statements we have (another phase, or the bank cut
+        # the reference) or was not allocated: the payment file says which documents the
+        # rejected transfer paid, provided the transfer amount is the cash that came back
+        hits = sorted(t for t in toks if t in self.run_by_e2e)
+        if len(hits) != 1:
+            return None
+        rows = list(
+            {(x["document_number"], x["doc_c"]): x for x in self.run_by_e2e[hits[0]]}.values()
+        )
+        x0 = rows[0]
+        if x0.get("debtor_account_id") != r["account_id"] or x0["execution_date"] > ctx.booking:
+            return None
+        xfer = abs(int(x0["xfer_c"]))
+        same = x0["currency"] == r["currency"] and abs(xfer - ctx.cash_c) <= 1
+        orig = x0["currency"] == r["orig_currency"] and abs(xfer - abs(ctx.orig_c)) <= 1
+        if not (same or orig):
+            return None
+        res = self._from_link_rows(r, ctx, "run", rows)
+        if not res or len(res.allocs) != len(rows):
+            return None
+        return Result(
+            txn, [Alloc(a.item, a.amount_c, "RETURNED") for a in res.allocs], rule="returned_e2e"
+        )
 
     def process(self, r: dict) -> Result:
         txn = r["bank_txn_id"]
@@ -803,6 +849,11 @@ class Engine:
         """Allocations from a linked detail file. In a payment run, a document in another
         currency than the debtor account is cleared with FX_DIFFERENCE (POLICIES §3; credit
         notes stay empty, PARTIAL / SHORT_DISPUTE keep their code)."""
+        if kind == "run_conf1":  # one transfer of a big confirming run: own rule tag
+            res = self._from_link(r, ctx, "run", payload)
+            if res:
+                res.rule = "link_confirming_one"
+            return res
         res = self._from_link_rows(r, ctx, kind, payload)
         if res and kind == "run":
             res.allocs = [
@@ -1107,6 +1158,50 @@ class Engine:
                 allocs = alt
         return Result(r["bank_txn_id"], allocs, rule="link_advice")
 
+    def _returned_dd(self, r: dict, ctx: Ctx, ftext: str) -> Result | None:
+        """A direct-debit return (POLICIES §3 RETURNED) re-opens the document of the collection
+        it reverses: the LATEST collection of the mandate named in the return, for this amount,
+        before the return. The same customer often has several invoices of the same amount, so
+        the collection files say which one; the family-wide guess below cannot."""
+        amt = ctx.cash_c
+        rows: list[dict] = []
+        for m in sorted({alnum(x.group(0)) for x in _MANDATE.finditer(ftext)}):
+            rows += [
+                x
+                for x in self.dd_by_mandate.get(m, ())
+                if abs(int(x["amt_c"]) - amt) <= 1
+                and str(x["collection_date"]) <= ctx.booking
+                and _within(ctx.booking, str(x["collection_date"]), 0, 45)
+            ]
+        if not rows:
+            return None
+        last = max(rows, key=lambda x: (str(x["collection_date"]), str(x["end_to_end_id"])))
+        party = self.parties.by_mandate.get(alnum(last["mandate_id"]))
+        ids: list[str] = []
+        for tok in sorted(text_tokens(str(last.get("remittance_info") or ""))):
+            for i in self.book.lookup(tok):
+                it = self.book.items[i]
+                if (
+                    i not in ids
+                    and it.entity == r["entity"]
+                    and it.side == "AR"
+                    and not it.is_credit
+                    and (party is None or it.party == party)
+                    and it.issue <= ctx.booking
+                    and (
+                        amt in [a for _t, a in self.book.paid.get(i, [])]
+                        or abs(it.total - amt) <= 1
+                    )
+                ):
+                    ids.append(i)
+        if len(ids) == 1:
+            return Result(r["bank_txn_id"], [Alloc(ids[0], amt, "RETURNED")], rule="returned_dd")
+        if not ids:
+            # the collected document is not in our book (settled before the period starts):
+            # any other invoice of the customer would be a wrong pair
+            return Result(r["bank_txn_id"], category="BANK_FEES", rule="returned_dd_unknown")
+        return None
+
     def _returned(self, r: dict, ctx: Ctx, parties: list[str], receipt: bool) -> Result | None:
         txn = r["bank_txn_id"]
         amt = ctx.cash_c
@@ -1135,6 +1230,10 @@ class Engine:
         ]
         if direct:
             return Result(txn, [Alloc(direct[0], amt, "RETURNED")], rule="returned_doc")
+        if not receipt:
+            res = self._returned_dd(r, ctx, ftext)
+            if res:
+                return res
         fam: set[str] = set()
         for p in parties[:2]:
             fam |= self.parties.family(p)

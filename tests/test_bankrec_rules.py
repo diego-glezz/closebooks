@@ -560,6 +560,40 @@ def _fake_engine(book: Book):
     return Engine, fake
 
 
+def test_direct_debit_return_reopens_the_collected_twin_invoice():
+    """returned_dd: two invoices of the same amount for the same mandate; the return re-opens
+    the one of the latest collection before it, not the newest invoice."""
+    from types import SimpleNamespace
+
+    b = make_book(
+        ("ARI-2025-0000001", "1042418192", 41475, "2025-03-01"),
+        ("ARI-2025-0000002", "1042419960", 41475, "2025-04-01"),
+    )
+    engine, fake = _fake_engine(b)
+    fake.parties = SimpleNamespace(by_mandate={"VTMUS0009314": "C1"})
+
+    def coll(day, doc):
+        return {"collection_date": day, "end_to_end_id": f"E{day}", "amt_c": 41475,
+                "mandate_id": "VTM-US-0009314", "remittance_info": doc}  # fmt: skip
+
+    fake.dd_by_mandate = {
+        "VTMUS0009314": [coll("2025-03-31", "RECIBO 418192"), coll("2025-05-02", "1042419960")]
+    }
+    r = {"bank_txn_id": "BT1", "entity": "ES01"}
+    text = "RUECKLASTSCHRIFT AM04 MREF+VTM-US-0009314"
+    got = engine._returned_dd(fake, r, ctx(41475, "2025-04-03"), text)
+    assert [(a.item, a.amount_c, a.exception) for a in got.allocs] == [
+        ("ARI-2025-0000001", 41475, "RETURNED")
+    ]
+    assert got.rule == "returned_dd"
+    # the collected document is not in the book: no pair at all rather than its twin
+    fake.dd_by_mandate["VTMUS0009314"][0]["remittance_info"] = "1042400001"
+    got = engine._returned_dd(fake, r, ctx(41475, "2025-04-03"), text)
+    assert not got.allocs and got.rule == "returned_dd_unknown"
+    # no collection of that mandate and amount before the return: not this rule
+    assert engine._returned_dd(fake, r, ctx(41475, "2025-03-20"), text) is None
+
+
 def test_cited_invoices_paid_net_of_a_subset_of_credit_notes():
     """ref_cn_subset: the shortfall is exactly ONE subset of the party's open credit notes."""
     b = make_book(
